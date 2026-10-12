@@ -361,7 +361,7 @@ async function translateWithLlm(llm, provider, model, text, targetLanguage, time
  * catalog) uses that one. bing/google are free translation engines (model is
  * ignored for them).
  */
-async function* translateStream(original, config, signal, llm, currentModel, debug) {
+async function* translateStream(original, config, signal, llm, currentModel) {
   const buffers = new Map() // index -> { chunks: [...], text: '' }
   const language = resolveLanguage(config.targetLanguage)
 
@@ -418,7 +418,6 @@ async function* translateStream(original, config, signal, llm, currentModel, deb
               model = currentModel.model
             }
             const isFreeEngine = provider === 'bing' || provider === 'google'
-            debug?.(`  block-end translate: blockType=${blockType} mode=${mode} provider=${provider} model=${model} free=${isFreeEngine} textlen=${text.length} strippedlen=${stripped.length}`)
             // Cache per (provider, model, language, text) so retries, replays,
             // and repeated blocks do not re-invoke the translation service.
             const runTranslate = (m) => cachedTranslate(
@@ -434,7 +433,6 @@ async function* translateStream(original, config, signal, llm, currentModel, deb
               // If the chosen model is unknown to the resolved provider, fall
               // back to the current conversation's model instead of dropping.
               if (!isFreeEngine && currentModel.model && currentModel.model !== model) {
-                debug?.(`  model "${model}" rejected (${e?.message}); retry with current model ${currentModel.model}`)
                 provider = currentModel.provider
                 model = currentModel.model
                 translated = await runTranslate(model)
@@ -444,13 +442,11 @@ async function* translateStream(original, config, signal, llm, currentModel, deb
             }
 
             const finalText = reinsertCode(translated, spans)
-            debug?.(`  translated ok: finalTextlen=${finalText.length}`)
             const deltaType = blockType === 'reasoning' ? 'reasoning-delta' : 'text-delta'
             yield { type: deltaType, index: chunk.index, text: finalText }
             yield { ...chunk, block: { ...chunk.block, text: finalText } }
-          } catch (e) {
+          } catch (_e) {
             // Translation failed — flush original buffered chunks.
-            debug?.(`  translate FAILED: ${e?.message || e}`)
             for (const original of entry.chunks) yield original
             yield chunk
           }
@@ -490,19 +486,9 @@ function snapshot(config) {
   }
 }
 
-/** TEMP DIAGNOSTIC: append a line to ~/dsh-translator-debug.log */
-import { appendFileSync } from 'node:fs'
-import { homedir } from 'node:os'
-import { join } from 'node:path'
-const DEBUG_LOG = join(homedir(), 'dsh-translator-debug.log')
-function debug(msg) {
-  try { appendFileSync(DEBUG_LOG, `${new Date().toISOString()} ${msg}\n`) } catch { /* ignore */ }
-}
-
 export const inject = ['llm']
 
 export function apply(ctx, config) {
-  debug(`apply called; llm=${typeof ctx.get('llm')}; provider=${config.provider?.get?.()} model=${config.model?.get?.()} out=${config.translateOutput?.get?.()} think=${config.translateThinking?.get?.()}`)
   const llm = ctx.get('llm')
 
   // Re-entrancy guard: prevent waterfall recursion when translateWithLlm
@@ -510,10 +496,9 @@ export function apply(ctx, config) {
   let inStream = false
 
   ctx.on('llm/stream', (options, next) => {
-    debug(`llm/stream hit; provider=${options.provider} model=${options.model} inStream=${inStream}`)
     // Re-read volatile config on every stream so live settings edits apply.
     const cfg = snapshot(config)
-    if (!cfg.translateOutput && !cfg.translateThinking) { debug('  skipped: both toggles off'); return next() }
+    if (!cfg.translateOutput && !cfg.translateThinking) return next()
     if (inStream) return next() // Skip re-entrant calls from translation LLM
 
     // Follow the current stream's provider/model so model translation uses
@@ -524,7 +509,7 @@ export function apply(ctx, config) {
     inStream = true
     return (async function* () {
       try {
-        yield* translateStream(original, cfg, options.signal, llm, currentModel, debug)
+        yield* translateStream(original, cfg, options.signal, llm, currentModel)
       } finally {
         inStream = false
       }
