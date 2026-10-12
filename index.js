@@ -12,8 +12,33 @@ const DEFAULT_MODEL = 'deepseek-flash'
  *  has no `toJSON`, so the entry is skipped and the settings panel reports
  *  "unavailable". Marking a field `.volatile()` also makes it live-editable:
  *  apply() then receives Volatile getters and reads the current value with
- *  `.get()` so a settings change takes effect without remounting the plugin. */
-import z from '@deepseek-ai/schemastery'
+ *  `.get()` so a settings change takes effect without remounting the plugin.
+ *
+ *  schemastery is loaded via createRequire against the profile node_modules:
+ *  this plugin is symlinked into the profile from a workspace directory that
+ *  has no node_modules of its own, so a bare ESM `import` of
+ *  '@deepseek-ai/schemastery' cannot resolve (Node walks the workspace's real
+ *  ancestor chain, which never reaches the profile). createRequire rooted in
+ *  the profile dir resolves the hoisted dependency instead. */
+import { createRequire } from 'node:module'
+import { join } from 'node:path'
+
+function loadSchemastery() {
+  // Prefer the profile node_modules (hoisted), then the ambient resolver.
+  const profileDir = process.env.DSH_PROFILE_DIR
+  if (profileDir) {
+    try {
+      const req = createRequire(join(profileDir, '.dsh-resolve-anchor.js'))
+      const mod = req('@deepseek-ai/schemastery')
+      return (mod.default ?? mod)
+    } catch (_e) { /* fall through */ }
+  }
+  // Fallback: resolve from this module's own location (works for real installs).
+  const req = createRequire(import.meta.url)
+  const mod = req('@deepseek-ai/schemastery')
+  return (mod.default ?? mod)
+}
+const z = loadSchemastery()
 
 export const Config = z.object({
   // Three providers: 'auto' translates with a dsh-loaded model (the current
