@@ -51,7 +51,7 @@ Every field is `.volatile()`, so the settings panel is live-editable and
 | `translateOutput` | `true` | |
 | `translateThinking` | `true` | |
 | `timeoutMs` | `10000` | Bounded to 100–60000 |
-| `maxTextChars` | `4000` | Longer blocks pass through untranslated |
+| `maxTextChars` | `4000` | Per-request segment size; longer blocks are split and translated in full (no hard cap) |
 
 The form offers `auto`, `zh`, `en`, `ja`, `ko`, `fr`, `de`, `es`; the config
 itself accepts any language tag, so `zh-TW` or `pt-BR` works if you edit
@@ -66,15 +66,15 @@ per provider — `zh-Hans` / `zh-Hant` for Bing, `zh-CN` / `zh-TW` for Google.
   appended back at the end — it is never lost.
 - **Translation failures are invisible.** Any error — a timeout, an HTTP
   failure, a malformed response, or a translation model that starts emitting
-  reasoning — flushes the original text unchanged. You never get a half-translated
-  answer.
-- **No translation recursion.** A re-entrancy guard skips the `llm/stream` call
-  the translation model makes of its own, so translation never translates itself.
-- **Repeated blocks are cheap.** A process-lifetime cache, bounded at 500
-  entries and keyed by provider, model, language and text, so retries, replays
-  and duplicate blocks translate once. Failures are not cached, so a transient
-  outage clears on the next attempt; concurrent identical misses share a single
-  call.
+  reasoning — flushes the original text unchanged. A failed segment fails the
+  whole block, so you never get a half-translated answer.
+- **No translation recursion.** The re-entrancy guard targets only the
+  `llm/stream` call this plugin itself issues (detected via an async-local
+  store), so translation never translates itself — and never suppresses a
+  concurrent genuine stream either.
+- **Concurrent streams are safe.** Because the guard is per-call, not a
+  process-wide flag, teammate, subagent and workflow streams running at the
+  same time are each translated independently.
 - **Free engines are firewalled.** Bing/Google requests use
   `credentials: 'omit'` and treat any redirect as an error.
 
@@ -157,7 +157,7 @@ entirely.
 | `translateOutput` | `true` | |
 | `translateThinking` | `true` | |
 | `timeoutMs` | `10000` | 限制在 100–60000 |
-| `maxTextChars` | `4000` | 更长的块不翻译、原样通过 |
+| `maxTextChars` | `4000` | 每段请求大小；更长的块会被切分并完整翻译（无硬上限） |
 
 表单提供 `auto`、`zh`、`en`、`ja`、`ko`、`fr`、`de`、`es`；配置本身接受任意语言
 标签，所以直接改 `cordis.patch.yml` 时用 `zh-TW` 或 `pt-BR` 也可以。简繁中文按
@@ -169,12 +169,12 @@ entirely.
   形式的占位符，翻译完再原样插回。如果翻译把占位符弄丢了，代码会被追加回结尾 ——
   代码不会丢。
 - **翻译失败是无形的。** 任何错误 —— 超时、HTTP 失败、响应格式异常、或者翻译模型
-  开始吐出推理内容 —— 都会把原文原样冲出。你永远不会看到一个翻译了一半的答案。
-- **没有翻译递归。** 重入守卫会跳过翻译模型自己发起的 `llm/stream` 调用，因此翻译
-  不会去翻译翻译本身。
-- **重复的块很便宜。** 一个进程生命周期的缓存，上限 500 条，按 provider、model、
-  语言与文本做键，因此重试、重放与重复块只翻译一次。失败不写缓存，所以临时故障
-  下次尝试就恢复；并发的相同未命中共享同一次调用。
+  开始吐出推理内容 —— 都会把原文原样冲出。某段翻译失败会让整块回退原文，所以你
+  永远不会看到一个翻译了一半的答案。
+- **没有翻译递归。** 重入守卫只针对插件自己发起的那次 `llm/stream` 调用（用
+  async-local 存储识别），因此翻译不会去翻译翻译本身——也不会误杀并发的真实流。
+- **并发流是安全的。** 守卫是按调用而非进程级开关，因此同时运行的 teammate、
+  subagent、workflow 流各自独立翻译。
 - **免费引擎被隔离。** Bing/Google 请求使用 `credentials: 'omit'`，任何重定向都视为
   错误。
 
