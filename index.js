@@ -1,15 +1,6 @@
 /** Self-contained host plugin: intercepts llm/stream to translate model output.
  *  Supports Bing/Google free APIs (direct HTTP) and DeepSeek models (via LLM runtime). */
 
-import { appendFileSync } from 'node:fs'
-import { homedir } from 'node:os'
-import { join } from 'node:path'
-
-const DEBUG_LOG = join(homedir(), 'dsh-translator-debug.log')
-function debug(msg) {
-  try { appendFileSync(DEBUG_LOG, `${new Date().toISOString()} ${msg}\n`) } catch { /* ignore */ }
-}
-
 const BING_ENDPOINT = 'https://edge.microsoft.com/translate/translatetext'
 const GOOGLE_ENDPOINT = 'https://translate.googleapis.com/translate_a/single'
 const DEFAULT_MODEL = 'deepseek-flash'
@@ -426,8 +417,6 @@ async function* translateStream(original, config, signal, llm, currentModel) {
           ((blockType === 'text' && config.translateOutput) ||
            (blockType === 'reasoning' && config.translateThinking))
 
-        debug(`block-end idx=${chunk.index} type=${blockType} textlen=${text.length} chunkSize=${config.maxTextChars} out=${config.translateOutput} think=${config.translateThinking} shouldTranslate=${!!shouldTranslate}`)
-
         if (shouldTranslate) {
           try {
             // Strip code blocks/inline code so they are never translated.
@@ -474,13 +463,11 @@ async function* translateStream(original, config, signal, llm, currentModel) {
             }
 
             const finalText = reinsertCode(translated, spans)
-            debug(`  translate ok idx=${chunk.index} type=${blockType} finalTextlen=${finalText.length}`)
             const deltaType = blockType === 'reasoning' ? 'reasoning-delta' : 'text-delta'
             yield { type: deltaType, index: chunk.index, text: finalText }
             yield { ...chunk, block: { ...chunk.block, text: finalText } }
-          } catch (e) {
+          } catch (_e) {
             // Translation failed — flush original buffered chunks.
-            debug(`  translate FAILED idx=${chunk.index} type=${blockType}: ${e?.message || e}`)
             for (const original of entry.chunks) yield original
             yield chunk
           }
@@ -523,7 +510,6 @@ function snapshot(config) {
 export const inject = ['llm']
 
 export function apply(ctx, config) {
-  debug(`apply called; llm=${typeof ctx.get('llm')}`)
   const llm = ctx.get('llm')
 
   // Re-entrancy guard: prevent waterfall recursion when translateWithLlm
@@ -531,10 +517,9 @@ export function apply(ctx, config) {
   let inStream = false
 
   ctx.on('llm/stream', (options, next) => {
-    debug(`llm/stream hit; provider=${options.provider} model=${options.model} inStream=${inStream}`)
     // Re-read volatile config on every stream so live settings edits apply.
     const cfg = snapshot(config)
-    if (!cfg.translateOutput && !cfg.translateThinking) { debug('  skipped: both toggles off'); return next() }
+    if (!cfg.translateOutput && !cfg.translateThinking) return next()
     if (inStream) return next() // Skip re-entrant calls from translation LLM
 
     // Follow the current stream's provider/model so model translation uses
