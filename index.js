@@ -211,6 +211,22 @@ function extractCode(text) {
     return p
   })
 
+  // Markdown links: [text](url) — protect the URL part so it's never translated.
+  // The text part inside brackets will be translated normally.
+  stripped = stripped.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (m, text, url) => {
+    const urlPlaceholder = placeholder()
+    spans.push(url)
+    return `[${text}](${urlPlaceholder})`
+  })
+
+  // HTML/XML tags: <tag>, <tag attr="value">, </tag>, <tag/>
+  // Protect the entire tag so attributes and structure are never translated.
+  stripped = stripped.replace(/<\/?[a-zA-Z][a-zA-Z0-9]*[^>]*\/?>/g, (m) => {
+    const p = placeholder()
+    spans.push(m)
+    return p
+  })
+
   return { stripped, spans }
 }
 
@@ -548,6 +564,14 @@ function localizePunctuation(text) {
     .replace(/;(?=\s*$)/g, '；')
     .replace(/;\s*([)\]"'])\s*/g, '；$1')
     .replace(/;\s+(?=[^<\n])/g, '；')
+    // Colon at end of line (before \n): preserve newline
+    .replace(/:\s*\n/g, '：\n')
+    // Colon followed by end of string
+    .replace(/:$/, '：')
+    // Colon followed by closing bracket
+    .replace(/:\s*([)\]"'])\s*/g, '：$1')
+    // Colon followed by space (but not in time format like 3:30)
+    .replace(/:\s+(?=[^<\n\d])/g, '：')
 
   // Restore protected spans.
   work = work.replace(/\x00(\d+)\x00/g, (_, i) => protectedSpans[parseInt(i, 10)] || '')
@@ -659,6 +683,19 @@ function localizeNumbers(text) {
     (_, num) => num.replace(/,/g, '')
   )
 
+  // Time format: "3:30 PM" → "下午3:30", "9:00 AM" → "上午9:00"
+  // Pattern: hour:minute AM/PM (12-hour format with AM/PM indicator)
+  work = work.replace(
+    /\b(\d{1,2}):(\d{2})\s*(AM|PM|am|pm)\b/g,
+    (_, hour, minute, period) => {
+      const h = parseInt(hour, 10)
+      const m = parseInt(minute, 10)
+      const periodUpper = period.toUpperCase()
+      const prefix = periodUpper === 'AM' ? '上午' : '下午'
+      return `${prefix}${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`
+    }
+  )
+
   // Restore protected spans.
   work = work.replace(/\x00(\d+)\x00/g, (_, i) => protectedSpans[parseInt(i, 10)] || '')
 
@@ -713,6 +750,19 @@ function convertAbbreviations(text) {
   work = work.replace(/\bprof\./gi, '教授')
   work = work.replace(/\bU\.S\./g, '美国')
   work = work.replace(/\bU\.K\./g, '英国')
+  // Document/paper abbreviations
+  work = work.replace(/\bNo\.\s*(\d+)/g, '第$1')
+  work = work.replace(/\bVol\./gi, '卷')
+  work = work.replace(/\bFig\./gi, '图')
+  work = work.replace(/\bPage\s*(\d+)/gi, '第$1页')
+  work = work.replace(/\bpp\.\s*(\d+)/gi, '第$1页')
+  // Business/organization abbreviations
+  work = work.replace(/\bR&D\b/g, '研发')
+  work = work.replace(/\bCEO\b/g, '首席执行官')
+  work = work.replace(/\bCFO\b/g, '首席财务官')
+  work = work.replace(/\bCTO\b/g, '首席技术官')
+  work = work.replace(/\bCOO\b/g, '首席运营官')
+  work = work.replace(/\bCFO\b/g, '首席财务官')
 
   // Restore protected spans.
   work = work.replace(/\x00(\d+)\x00/g, (_, i) => protectedSpans[parseInt(i, 10)] || '')
