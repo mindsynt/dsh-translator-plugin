@@ -432,10 +432,13 @@ function snapshot(config) {
 /** TEMP DIAGNOSTIC: append a line to ~/dsh-translator-debug.log */
 import { appendFileSync } from 'node:fs'
 import { homedir } from 'node:os'
+import { join } from 'node:path'
 const DEBUG_LOG = join(homedir(), 'dsh-translator-debug.log')
 function debug(msg) {
   try { appendFileSync(DEBUG_LOG, `${new Date().toISOString()} ${msg}\n`) } catch { /* ignore */ }
 }
+
+export const inject = ['llm']
 
 export function apply(ctx, config) {
   debug(`apply called; llm=${typeof ctx.get('llm')}; provider=${config.provider?.get?.()} model=${config.model?.get?.()} out=${config.translateOutput?.get?.()} think=${config.translateThinking?.get?.()}`)
