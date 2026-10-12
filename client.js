@@ -17,9 +17,10 @@ window.__ModuleLoader__.load({
       subtitle: 'Automatically translates model output and thinking (reasoning) during streaming. If translation fails, the original text is shown.',
       provider: 'Translation Provider',
       providerHintFree: 'Free translation API \u2014 no model inference, text is sent to the translation service.',
-      providerHintAuto: 'Translates with a dsh-loaded model. Defaults to the current conversation\u2019s model, or pick one below.',
+      providerHintAuto: 'Follow the current conversation\u2019s model (no separate model pick).',
+      providerHintModel: 'Translate with a specific dsh-loaded model. Pick one below.',
       model: 'Translation Model',
-      modelHintAuto: 'Choose \u201cAuto\u201d to follow the current conversation\u2019s model, or pick a specific model below to override.',
+      modelHintModel: 'Pick a dsh-loaded model for translation. It uses that model\u2019s own provider route.',
       modelAuto: 'Auto (follow current conversation model)',
       modelLoading: 'Loading available models\u2026',
       modelLoadFailed: 'Could not load the model list.',
@@ -28,6 +29,7 @@ window.__ModuleLoader__.load({
       translateOutput: 'Translate model output',
       translateThinking: 'Translate thinking (reasoning)',
       providerAuto: 'Auto (follow current conversation model)',
+      providerModel: 'Model translation engine (pick a model)',
       providerBing: 'Bing Translate (free)',
       providerGoogle: 'Google Translate (free)',
       langAuto: 'Auto (follow interface language)',
@@ -52,9 +54,10 @@ window.__ModuleLoader__.load({
       subtitle: '在流式输出时自动翻译模型输出和思考（推理）。翻译失败时显示原文。',
       provider: '翻译服务',
       providerHintFree: '免费翻译 API —— 不调用模型，文本会发送到翻译服务。',
-      providerHintAuto: '使用 dsh 已加载的模型翻译。默认跟随当前对话的模型，也可在下方选一个具体模型。',
+      providerHintAuto: '跟随当前对话的模型翻译（不另选模型）。',
+      providerHintModel: '用一个 dsh 已加载的指定模型翻译。在下方选择模型。',
       model: '翻译模型',
-      modelHintAuto: '选择“自动”跟随当前对话的模型，或在下方选一个具体模型来覆盖。',
+      modelHintModel: '选择一个 dsh 已加载的模型用于翻译。翻译时会用该模型所属的服务。',
       modelAuto: '自动（跟随当前对话模型）',
       modelLoading: '正在加载可用模型…',
       modelLoadFailed: '无法加载模型列表。',
@@ -63,6 +66,7 @@ window.__ModuleLoader__.load({
       translateOutput: '翻译模型输出',
       translateThinking: '翻译模型思考（推理）',
       providerAuto: '自动（跟随当前对话模型）',
+      providerModel: '模型翻译引擎（选择模型）',
       providerBing: 'Bing 翻译（免费）',
       providerGoogle: 'Google 翻译（免费）',
       langAuto: '自动（跟随界面语言）',
@@ -88,12 +92,13 @@ window.__ModuleLoader__.load({
     function providerLabel(t, value) {
       switch (value) {
         case 'auto': return t('providerAuto');
+        case 'model': return t('providerModel');
         case 'bing': return t('providerBing');
         case 'google': return t('providerGoogle');
         default: return value;
       }
     }
-    const PROVIDER_VALUES = ['auto', 'bing', 'google'];
+    const PROVIDER_VALUES = ['auto', 'model', 'bing', 'google'];
 
     function languageLabel(t, value) {
       switch (value) {
@@ -170,16 +175,15 @@ window.__ModuleLoader__.load({
         setSaving(true);
         setError(null);
         try {
-          // model is only meaningful for model routes (auto / deepseek-*),
-          // not for the free bing/google engines.
-          const isModel = !isFreeEngine(provider);
+          // model is only meaningful in 'model' mode (pick a loaded model).
+          const isModelMode = provider === 'model';
           const ops = [
             { op: 'set', path: ['provider'],        value: provider },
             { op: 'set', path: ['targetLanguage'],  value: language },
             { op: 'set', path: ['translateOutput'], value: translateOutput },
             { op: 'set', path: ['translateThinking'], value: translateThinking },
           ];
-          if (isModel) ops.push({ op: 'set', path: ['model'], value: model });
+          if (isModelMode) ops.push({ op: 'set', path: ['model'], value: model });
 
           const ok = await form.mutate(ops);
           if (ok) setSaved(true);
@@ -191,9 +195,9 @@ window.__ModuleLoader__.load({
         }
       }
 
-      const disabled  = snapshot.status !== 'ready' || !snapshot.writable || saving;
-      const isModel   = !isFreeEngine(provider);
-      const isFree    = isFreeEngine(provider);
+      const disabled    = snapshot.status !== 'ready' || !snapshot.writable || saving;
+      const isModelMode = provider === 'model';
+      const isFree      = isFreeEngine(provider);
 
       /* ── loading / unavailable guards ── */
       if (snapshot.status === 'loading')
@@ -235,11 +239,13 @@ window.__ModuleLoader__.load({
             PROVIDER_VALUES.map((v) => h('option', { key: v, value: v }, providerLabel(t, v))),
           ),
           h('p', { style: S.desc },
-            isFree ? t('providerHintFree') : t('providerHintAuto')),
+            isFree ? t('providerHintFree')
+              : provider === 'model' ? t('providerHintModel')
+              : t('providerHintAuto')),
         ),
 
-        /* ── Model (model routes only) ── */
-        isModel ? h('div', { style: { display: 'flex', flexDirection: 'column', gap: '6px' } },
+        /* ── Model (only in 'model' mode) ── */
+        isModelMode ? h('div', { style: { display: 'flex', flexDirection: 'column', gap: '6px' } },
           h('label', { style: S.label }, t('model')),
           modelsLoading
             ? h('div', { style: { ...S.input, display: 'flex', alignItems: 'center', color: '#888' } }, t('modelLoading'))
@@ -254,7 +260,7 @@ window.__ModuleLoader__.load({
                   : [h('option', { key: 'auto', value: 'auto' }, t('modelAuto'))],
               ),
           modelsError ? h('p', { style: { ...S.desc, color: '#d32f2f' } }, t('modelLoadFailed')) : null,
-          h('p', { style: S.desc }, t('modelHintAuto')),
+          h('p', { style: S.desc }, t('modelHintModel')),
         ) : null,
 
         /* ── Target Language ── */

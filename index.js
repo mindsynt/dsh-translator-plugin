@@ -25,13 +25,14 @@ import z from '@deepseek-ai/schemastery'
 
 
 export const Config = z.object({
-  // Three providers: 'auto' translates with a dsh-loaded model (the current
-  // conversation's model by default, or a model picked from the catalog);
-  // 'bing'/'google' are free HTTP translation engines that never call a model.
-  provider: z.union(['auto', 'bing', 'google']).default('auto').volatile(),
-  // 'auto' (default) follows the current conversation's model; a concrete
-  // model id (picked from dsh's loaded catalog) overrides it. Only meaningful
-  // when provider is 'auto' (a model route), not for bing/google.
+  // Four translation modes:
+  //  'auto'   — follow the current conversation's provider+model (no model pick)
+  //  'model'  — translate with a specific dsh-loaded model chosen below; the
+  //             provider is looked up from that model's catalog group
+  //  'bing'/'google' — free HTTP translation engines (never call a model)
+  provider: z.union(['auto', 'model', 'bing', 'google']).default('auto').volatile(),
+  // Only meaningful for 'model': a concrete model id from dsh's loaded catalog.
+  // 'auto' (or under the 'auto' provider) follows the current conversation's model.
   model: z.string().default('auto').volatile(),
   targetLanguage: z.string().default('auto').volatile(),
   translateOutput: z.boolean().default(true).volatile(),
@@ -270,6 +271,43 @@ async function cachedTranslate(provider, model, targetLanguage, text, translate)
 }
 
 /**
+ * Cache of model id → provider route, built once by scanning the LLM runtime's
+ * registered providers and their advertised models. Used when the user picks a
+ * concrete translation model: its owning provider route is looked up so the
+ * translation call targets the right adapter instead of the conversation's.
+ */
+const modelProviderMap = new Map()
+let modelProviderMapBuilt = false
+
+/**
+ * Resolve the provider route that owns `modelId`, or undefined if unknown.
+ * @param llm - the LLM runtime service.
+ * @param modelId - a concrete model id from dsh's loaded catalog.
+ */
+async function providerForModel(llm, modelId) {
+  if (!modelId || modelId === 'auto') return undefined
+  if (modelProviderMapBuilt) return modelProviderMap.get(modelId)
+  modelProviderMapBuilt = true
+  if (typeof llm?.listProviders !== 'function') return undefined
+  try {
+    for (const info of llm.listProviders()) {
+      const provider = info.id
+      try {
+        const models = typeof llm.listModels === 'function'
+          ? await llm.listModels(provider)
+          : []
+        for (const m of models ?? []) {
+          if (typeof m === 'object' && m !== null && typeof m.id === 'string') {
+            modelProviderMap.set(m.id, provider)
+          }
+        }
+      } catch { /* provider listing failed; skip */ }
+    }
+  } catch { /* listProviders failed */ }
+  return modelProviderMap.get(modelId)
+}
+
+/**
  * Translate text using the LLM runtime (a dsh-loaded model route). The LLM
  * service handles auth and rate limiting.
  */
@@ -361,26 +399,49 @@ async function* translateStream(original, config, signal, llm, currentModel, deb
           try {
             // Strip code blocks/inline code so they are never translated.
             const { stripped, spans } = extractCode(text)
-            // Resolve provider: 'auto' is the only model route — it follows
-            // the current conversation's provider. bing/google are free engines.
-            const provider = config.provider === 'auto'
-              ? currentModel.provider
-              : config.provider
+            // Resolve provider/model by mode:
+            //  'auto'   → current conversation's provider + model (follow chat)
+            //  'model'  → the chosen model + the provider route that owns it
+            //  'bing'/'google' → free HTTP engine (model irrelevant)
+            const mode = config.provider
+            let provider, model
+            if (mode === 'bing' || mode === 'google') {
+              provider = mode
+              model = config.model
+            } else if (mode === 'model') {
+              // Look up the provider route that owns the chosen model.
+              provider = (await providerForModel(llm, config.model)) ?? currentModel.provider
+              model = config.model === 'auto' ? currentModel.model : config.model
+            } else {
+              // 'auto' — follow the current conversation entirely.
+              provider = currentModel.provider
+              model = currentModel.model
+            }
             const isFreeEngine = provider === 'bing' || provider === 'google'
-            // Resolve model: 'auto' follows the current conversation's model;
-            // a concrete model id (from dsh's catalog) overrides it.
-            const model = config.model === 'auto'
-              ? currentModel.model
-              : config.model
-            debug?.(`  block-end translate: blockType=${blockType} provider=${provider} model=${model} free=${isFreeEngine} textlen=${text.length} strippedlen=${stripped.length}`)
+            debug?.(`  block-end translate: blockType=${blockType} mode=${mode} provider=${provider} model=${model} free=${isFreeEngine} textlen=${text.length} strippedlen=${stripped.length}`)
             // Cache per (provider, model, language, text) so retries, replays,
             // and repeated blocks do not re-invoke the translation service.
-            const translated = await cachedTranslate(
-              provider, model, language, stripped,
+            const runTranslate = (m) => cachedTranslate(
+              provider, m, language, stripped,
               (text) => isFreeEngine
                 ? translateText(provider, text, language, config.timeoutMs, signal)
-                : translateWithLlm(llm, provider, model || DEFAULT_MODEL, text, language, config.timeoutMs, signal),
+                : translateWithLlm(llm, provider, m || DEFAULT_MODEL, text, language, config.timeoutMs, signal),
             )
+            let translated
+            try {
+              translated = await runTranslate(model)
+            } catch (e) {
+              // If the chosen model is unknown to the resolved provider, fall
+              // back to the current conversation's model instead of dropping.
+              if (!isFreeEngine && currentModel.model && currentModel.model !== model) {
+                debug?.(`  model "${model}" rejected (${e?.message}); retry with current model ${currentModel.model}`)
+                provider = currentModel.provider
+                model = currentModel.model
+                translated = await runTranslate(model)
+              } else {
+                throw e
+              }
+            }
 
             const finalText = reinsertCode(translated, spans)
             debug?.(`  translated ok: finalTextlen=${finalText.length}`)
