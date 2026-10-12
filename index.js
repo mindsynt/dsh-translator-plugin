@@ -14,31 +14,15 @@ const DEFAULT_MODEL = 'deepseek-flash'
  *  apply() then receives Volatile getters and reads the current value with
  *  `.get()` so a settings change takes effect without remounting the plugin.
  *
- *  schemastery is loaded via createRequire against the profile node_modules:
- *  this plugin is symlinked into the profile from a workspace directory that
- *  has no node_modules of its own, so a bare ESM `import` of
- *  '@deepseek-ai/schemastery' cannot resolve (Node walks the workspace's real
- *  ancestor chain, which never reaches the profile). createRequire rooted in
- *  the profile dir resolves the hoisted dependency instead. */
-import { createRequire } from 'node:module'
-import { join } from 'node:path'
+ *  A bare `import` of '@deepseek-ai/schemastery' resolves through the
+ *  Loader's bare-module interception layer, which maps symlinked @local
+ *  plugins to the profile's hoisted node_modules. Do NOT replace it with
+ *  createRequire(import.meta.url): that resolves from this module's real
+ *  (workspace) ancestor chain, which has no node_modules, and the Host
+ *  process does not export DSH_PROFILE_DIR, so such a fallback throws and
+ *  fails the whole module load (no Config, no apply, no translation). */
+import z from '@deepseek-ai/schemastery'
 
-function loadSchemastery() {
-  // Prefer the profile node_modules (hoisted), then the ambient resolver.
-  const profileDir = process.env.DSH_PROFILE_DIR
-  if (profileDir) {
-    try {
-      const req = createRequire(join(profileDir, '.dsh-resolve-anchor.js'))
-      const mod = req('@deepseek-ai/schemastery')
-      return (mod.default ?? mod)
-    } catch (_e) { /* fall through */ }
-  }
-  // Fallback: resolve from this module's own location (works for real installs).
-  const req = createRequire(import.meta.url)
-  const mod = req('@deepseek-ai/schemastery')
-  return (mod.default ?? mod)
-}
-const z = loadSchemastery()
 
 export const Config = z.object({
   // Three providers: 'auto' translates with a dsh-loaded model (the current
@@ -339,7 +323,7 @@ async function translateWithLlm(llm, provider, model, text, targetLanguage, time
  * catalog) uses that one. bing/google are free translation engines (model is
  * ignored for them).
  */
-async function* translateStream(original, config, signal, llm, currentModel) {
+async function* translateStream(original, config, signal, llm, currentModel, debug) {
   const buffers = new Map() // index -> { chunks: [...], text: '' }
   const language = resolveLanguage(config.targetLanguage)
 
@@ -388,6 +372,7 @@ async function* translateStream(original, config, signal, llm, currentModel) {
             const model = config.model === 'auto'
               ? currentModel.model
               : config.model
+            debug?.(`  block-end translate: blockType=${blockType} provider=${provider} model=${model} free=${isFreeEngine} textlen=${text.length} strippedlen=${stripped.length}`)
             // Cache per (provider, model, language, text) so retries, replays,
             // and repeated blocks do not re-invoke the translation service.
             const translated = await cachedTranslate(
@@ -398,11 +383,13 @@ async function* translateStream(original, config, signal, llm, currentModel) {
             )
 
             const finalText = reinsertCode(translated, spans)
+            debug?.(`  translated ok: finalTextlen=${finalText.length}`)
             const deltaType = blockType === 'reasoning' ? 'reasoning-delta' : 'text-delta'
             yield { type: deltaType, index: chunk.index, text: finalText }
             yield { ...chunk, block: { ...chunk.block, text: finalText } }
-          } catch (_e) {
+          } catch (e) {
             // Translation failed — flush original buffered chunks.
+            debug?.(`  translate FAILED: ${e?.message || e}`)
             for (const original of entry.chunks) yield original
             yield chunk
           }
@@ -442,7 +429,16 @@ function snapshot(config) {
   }
 }
 
+/** TEMP DIAGNOSTIC: append a line to ~/dsh-translator-debug.log */
+import { appendFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+const DEBUG_LOG = join(homedir(), 'dsh-translator-debug.log')
+function debug(msg) {
+  try { appendFileSync(DEBUG_LOG, `${new Date().toISOString()} ${msg}\n`) } catch { /* ignore */ }
+}
+
 export function apply(ctx, config) {
+  debug(`apply called; llm=${typeof ctx.get('llm')}; provider=${config.provider?.get?.()} model=${config.model?.get?.()} out=${config.translateOutput?.get?.()} think=${config.translateThinking?.get?.()}`)
   const llm = ctx.get('llm')
 
   // Re-entrancy guard: prevent waterfall recursion when translateWithLlm
@@ -450,9 +446,10 @@ export function apply(ctx, config) {
   let inStream = false
 
   ctx.on('llm/stream', (options, next) => {
+    debug(`llm/stream hit; provider=${options.provider} model=${options.model} inStream=${inStream}`)
     // Re-read volatile config on every stream so live settings edits apply.
     const cfg = snapshot(config)
-    if (!cfg.translateOutput && !cfg.translateThinking) return next()
+    if (!cfg.translateOutput && !cfg.translateThinking) { debug('  skipped: both toggles off'); return next() }
     if (inStream) return next() // Skip re-entrant calls from translation LLM
 
     // Follow the current stream's provider/model so model translation uses
@@ -463,7 +460,7 @@ export function apply(ctx, config) {
     inStream = true
     return (async function* () {
       try {
-        yield* translateStream(original, cfg, options.signal, llm, currentModel)
+        yield* translateStream(original, cfg, options.signal, llm, currentModel, debug)
       } finally {
         inStream = false
       }
