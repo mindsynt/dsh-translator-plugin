@@ -387,10 +387,22 @@ function extractNouns(text) {
 
   let stripped = text
 
-  // Step 1: Protect URLs and version numbers FIRST (they contain dots that
+  // Step 1: Protect template variables FIRST (they contain special chars that
+  // would confuse other regexes). Template syntaxes: {{name}}, ${var}, <%= user %>
+  stripped = stripped.replace(
+    /(?:\{\{[^}]+\}\}|\$\{[^}]+\}|<%[^%]+%>)/g,
+    (m) => {
+      if (m.startsWith('[[NOUN')) return m
+      const p = placeholder()
+      spans.push(m)
+      return p
+    }
+  )
+
+  // Step 2: Protect URLs and version numbers (they contain dots that
   // would confuse the proper-noun regex).
   stripped = stripped.replace(
-    /(?:https?:\/\/[^\s)>"']+|\bv?\d+(?:\.\d+)+[a-zA-Z0-9-]*)/g,
+    /(?:https?:\/\/[^\s)>"']+|\bv\d+(?:\.\d+)+[a-zA-Z0-9-]*|\b\d+(?:\.\d+)+-[a-zA-Z0-9-]*)/g,
     (m) => {
       if (m.startsWith('[[NOUN')) return m
       const p = placeholder()
@@ -497,7 +509,7 @@ function localizePunctuation(text) {
     // Email addresses
     .replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, protect)
     // Version numbers like v1.2.3, v2.0-beta
-    .replace(/\bv?\d+(\.\d+)+[a-zA-Z0-9-]*/g, protect)
+    .replace(/(?:\bv\d+(?:\.\d+)+[a-zA-Z0-9-]*|\b\d+(?:\.\d+)+-[a-zA-Z0-9-]*)/g, protect)
 
   // Now convert punctuation in the remaining prose.
   // In Chinese, there is NO space after punctuation (except newlines),
@@ -536,6 +548,357 @@ function localizePunctuation(text) {
     .replace(/;(?=\s*$)/g, '；')
     .replace(/;\s*([)\]"'])\s*/g, '；$1')
     .replace(/;\s+(?=[^<\n])/g, '；')
+
+  // Restore protected spans.
+  work = work.replace(/\x00(\d+)\x00/g, (_, i) => protectedSpans[parseInt(i, 10)] || '')
+
+  return work
+}
+
+/**
+ * Localize number formats from English to Chinese conventions.
+ *
+ * Conversions:
+ *  Thousand separators: "1,000" → "1000" (Chinese doesn't use commas)
+ *  Dates: "January 15, 2024" → "2024年1月15日"
+ *  Dates: "15 Jan 2024" → "2024年1月15日"
+ *  Currency: "$1,000" → "1000美元"
+ *  Currency: "€100" → "100欧元"
+ *  Currency: "£50" → "50英镑"
+ *
+ * Protected spans (code, URLs, emails, version numbers) are left untouched.
+ */
+function localizeNumbers(text) {
+  if (!text) return text
+
+  const protectedSpans = []
+  const protect = (m) => {
+    const i = protectedSpans.length
+    protectedSpans.push(m)
+    return `\x00${i}\x00`
+  }
+
+  let work = text
+    // Protect code blocks/spans, URLs, emails, version numbers
+    .replace(/```[\s\S]*?```|~~~[\s\S]*?~~~/g, protect)
+    .replace(/`[^`\n]+`/g, protect)
+    .replace(/https?:\/\/[^\s)>"']+/g, protect)
+    .replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, protect)
+    .replace(/(?:\bv\d+(?:\.\d+)+[a-zA-Z0-9-]*|\b\d+(?:\.\d+)+-[a-zA-Z0-9-]*)/g, protect)
+
+  // Date patterns: "January 15, 2024", "Jan 15, 2024", "15 January 2024", "15 Jan 2024"
+  const monthMap = {
+    'january': '1', 'jan': '1',
+    'february': '2', 'feb': '2',
+    'march': '3', 'mar': '3',
+    'april': '4', 'apr': '4',
+    'may': '5',
+    'june': '6', 'jun': '6',
+    'july': '7', 'jul': '7',
+    'august': '8', 'aug': '8',
+    'september': '9', 'sep': '9', 'sept': '9',
+    'october': '10', 'oct': '10',
+    'november': '11', 'nov': '11',
+    'december': '12', 'dec': '12',
+  }
+
+  // Pattern 1: "January 15, 2024" or "Jan 15, 2024"
+  work = work.replace(
+    /\b(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\s+(\d{1,2}),?\s+(\d{4})\b/gi,
+    (_, month, day, year) => {
+      const m = month.toLowerCase()
+      const monthNum = monthMap[m]
+      if (monthNum) {
+        return `${year}年${monthNum}月${day}日`
+      }
+      return `${year}年${month}月${day}日`
+    }
+  )
+
+  // Pattern 2: "15 January 2024" or "15 Jan 2024"
+  work = work.replace(
+    /\b(\d{1,2})\s+(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\s+(\d{4})\b/gi,
+    (_, day, month, year) => {
+      const m = month.toLowerCase()
+      const monthNum = monthMap[m]
+      if (monthNum) {
+        return `${year}年${monthNum}月${day}日`
+      }
+      return `${year}年${month}月${day}日`
+    }
+  )
+
+  // Currency: "$1,000" → "1000美元", "€100" → "100欧元", "£50" → "50英镑"
+  // Use \d[\d,]* to ensure the match starts with a digit (not a comma).
+  work = work.replace(
+    /\$(\d[\d,]*(?:\.\d+)?)(?!\d)/g,
+    (_, num) => {
+      const cleanNum = num.replace(/,/g, '')
+      return `${cleanNum}美元`
+    }
+  )
+  work = work.replace(
+    /€(\d[\d,]*(?:\.\d+)?)(?!\d)/g,
+    (_, num) => {
+      const cleanNum = num.replace(/,/g, '')
+      return `${cleanNum}欧元`
+    }
+  )
+  work = work.replace(
+    /£(\d[\d,]*(?:\.\d+)?)(?!\d)/g,
+    (_, num) => {
+      const cleanNum = num.replace(/,/g, '')
+      return `${cleanNum}英镑`
+    }
+  )
+
+  // Thousand separators in numbers: "1,000" → "1000", "1,000,000" → "1000000"
+  // Match numbers with commas that are NOT part of a currency or date pattern
+  work = work.replace(
+    /\b(\d{1,3}(?:,\d{3})+)(?:\.\d+)?\b/g,
+    (_, num) => num.replace(/,/g, '')
+  )
+
+  // Restore protected spans.
+  work = work.replace(/\x00(\d+)\x00/g, (_, i) => protectedSpans[parseInt(i, 10)] || '')
+
+  return work
+}
+
+/**
+ * Convert common English abbreviations to Chinese equivalents.
+ * These are applied AFTER translation (in case the model already translated
+ * them correctly), replacing any remaining English abbreviations.
+ *
+ * Conversions:
+ *  etc. → 等等
+ *  e.g. → 例如
+ *  i.e. → 即
+ *  vs. → 对比
+ *  Mr. → 先生
+ *  Ms. → 女士
+ *  Mrs. → 夫人
+ *  Dr. → 博士
+ *  Prof. → 教授
+ *  U.S. → 美国
+ *  U.K. → 英国
+ */
+function convertAbbreviations(text) {
+  if (!text) return text
+
+  const protectedSpans = []
+  const protect = (m) => {
+    const i = protectedSpans.length
+    protectedSpans.push(m)
+    return `\x00${i}\x00`
+  }
+
+  let work = text
+    // Protect code blocks/spans, URLs, emails, version numbers
+    .replace(/```[\s\S]*?```|~~~[\s\S]*?~~~/g, protect)
+    .replace(/`[^`\n]+`/g, protect)
+    .replace(/https?:\/\/[^\s)>"']+/g, protect)
+    .replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, protect)
+    .replace(/(?:\bv\d+(?:\.\d+)+[a-zA-Z0-9-]*|\b\d+(?:\.\d+)+-[a-zA-Z0-9-]*)/g, protect)
+
+  // Abbreviation mappings (applied in order, case-insensitive)
+  work = work.replace(/\betc\./gi, '等等')
+  work = work.replace(/\be\.g\./gi, '例如')
+  work = work.replace(/\bi\.e\./gi, '即')
+  work = work.replace(/\bvs\./gi, '对比')
+  work = work.replace(/\bmr\./gi, '先生')
+  work = work.replace(/\bms\./gi, '女士')
+  work = work.replace(/\bmrs\./gi, '夫人')
+  work = work.replace(/\bdr\./gi, '博士')
+  work = work.replace(/\bprof\./gi, '教授')
+  work = work.replace(/\bU\.S\./g, '美国')
+  work = work.replace(/\bU\.K\./g, '英国')
+
+  // Restore protected spans.
+  work = work.replace(/\x00(\d+)\x00/g, (_, i) => protectedSpans[parseInt(i, 10)] || '')
+
+  return work
+}
+
+/**
+ * Convert English brackets and quotes to Chinese full-width equivalents.
+ *
+ * Conversions:
+ *  () → （）
+ *  "" → ""
+ *  '' → ''
+ *
+ * Protected spans (code, URLs, emails, version numbers) are left untouched.
+ */
+function localizeBrackets(text) {
+  if (!text) return text
+
+  const protectedSpans = []
+  const protect = (m) => {
+    const i = protectedSpans.length
+    protectedSpans.push(m)
+    return `\x00${i}\x00`
+  }
+
+  let work = text
+    // Protect code blocks/spans, URLs, emails, version numbers
+    .replace(/```[\s\S]*?```|~~~[\s\S]*?~~~/g, protect)
+    .replace(/`[^`\n]+`/g, protect)
+    .replace(/https?:\/\/[^\s)>"']+/g, protect)
+    .replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, protect)
+    .replace(/(?:\bv\d+(?:\.\d+)+[a-zA-Z0-9-]*|\b\d+(?:\.\d+)+-[a-zA-Z0-9-]*)/g, protect)
+
+  // Brackets: () → （）
+  work = work.replace(/\(/g, '（')
+  work = work.replace(/\)/g, '）')
+
+  // Double quotes: "" → ""
+  // Simple approach: alternate between opening and closing
+  let quoteCount = 0
+  work = work.replace(/"/g, () => {
+    quoteCount++
+    return quoteCount % 2 === 1 ? '"' : '"'
+  })
+
+  // Single quotes: '' → ''
+  let singleCount = 0
+  work = work.replace(/'/g, () => {
+    singleCount++
+    return singleCount % 2 === 1 ? '\'' : '\''
+  })
+
+  // Restore protected spans.
+  work = work.replace(/\x00(\d+)\x00/g, (_, i) => protectedSpans[parseInt(i, 10)] || '')
+
+  return work
+}
+
+/**
+ * Convert English ordinal numbers to Chinese equivalents.
+ *
+ * Conversions:
+ *  1st → 第一
+ *  2nd → 第二
+ *  3rd → 第三
+ *  4th → 第四
+ *  5th → 第五
+ *  10th → 第十
+ *  11th → 第十一
+ *  12th → 第十二
+ *  13th → 第十三
+ *  21st → 第二十一
+ *  101st → 第一百零一
+ *  first → 第一
+ *  second → 第二
+ *  third → 第三
+ *  fourth → 第四
+ *  fifth → 第五
+ */
+function convertOrdinals(text) {
+  if (!text) return text
+
+  const protectedSpans = []
+  const protect = (m) => {
+    const i = protectedSpans.length
+    protectedSpans.push(m)
+    return `\x00${i}\x00`
+  }
+
+  let work = text
+    // Protect code blocks/spans, URLs, emails, version numbers
+    .replace(/```[\s\S]*?```|~~~[\s\S]*?~~~/g, protect)
+    .replace(/`[^`\n]+`/g, protect)
+    .replace(/https?:\/\/[^\s)>"']+/g, protect)
+    .replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, protect)
+    .replace(/(?:\bv\d+(?:\.\d+)+[a-zA-Z0-9-]*|\b\d+(?:\.\d+)+-[a-zA-Z0-9-]*)/g, protect)
+
+  // Word ordinals: first → 第一, second → 第二, etc.
+  const wordOrdinals = {
+    'first': '第一', 'second': '第二', 'third': '第三',
+    'fourth': '第四', 'fifth': '第五', 'sixth': '第六',
+    'seventh': '第七', 'eighth': '第八', 'ninth': '第九',
+    'tenth': '第十', 'eleventh': '第十一', 'twelfth': '第十二',
+  }
+  for (const [en, zh] of Object.entries(wordOrdinals)) {
+    work = work.replace(new RegExp('\\b' + en + '\\b', 'gi'), zh)
+  }
+
+  // Numeric ordinals: 1st → 第一, 2nd → 第二, etc.
+  // Chinese number system: 一, 二, 三, 四, 五, 六, 七, 八, 九, 十, 百, 千, 万
+  const chineseDigits = ['', '一', '二', '三', '四', '五', '六', '七', '八', '九']
+  const chineseUnits = ['', '十', '百', '千', '万']
+
+  function numberToChinese(num) {
+    if (num === 0) return '零'
+    const digits = ['', '一', '二', '三', '四', '五', '六', '七', '八', '九']
+    const units = ['', '十', '百', '千', '万']
+    let result = ''
+    let section = 0 // 0: 个位, 1: 十位, 2: 百位, 3: 千位, 4: 万位
+
+    // Handle 万 (10000)
+    if (num >= 10000) {
+      const wan = Math.floor(num / 10000)
+      const rest = num % 10000
+      result = digits[wan] + '万'
+      if (rest > 0) {
+        // Recursively handle the remainder
+        result += numberToChinese(rest)
+      }
+      return result
+    }
+
+    // Handle 千 (1000)
+    if (num >= 1000) {
+      const qian = Math.floor(num / 1000)
+      const rest = num % 1000
+      result = digits[qian] + '千'
+      if (rest > 0) {
+        if (rest < 100) result += '零'
+        result += numberToChinese(rest)
+      }
+      return result
+    }
+
+    // Handle 百 (100)
+    if (num >= 100) {
+      const bai = Math.floor(num / 100)
+      const rest = num % 100
+      result = digits[bai] + '百'
+      if (rest > 0) {
+        if (rest < 10) result += '零'
+        result += numberToChinese(rest)
+      }
+      return result
+    }
+
+    // Handle 十 (10-99)
+    if (num >= 10) {
+      const shi = Math.floor(num / 10)
+      const ge = num % 10
+      if (shi === 1) {
+        // 10-19: 十, 十一, 十二, ... (no leading 一)
+        result = '十'
+        if (ge > 0) result += digits[ge]
+      } else {
+        // 20-99: 二十, 二十一, 二十二, ...
+        result = digits[shi] + '十'
+        if (ge > 0) result += digits[ge]
+      }
+      return result
+    }
+
+    // Handle 1-9
+    return digits[num]
+  }
+
+  // Pattern: number + ordinal suffix (1st, 2nd, 3rd, 4th, 10th, etc.)
+  work = work.replace(/\b(\d+)(st|nd|rd|th)\b/gi, (_, num, suffix) => {
+    const n = parseInt(num, 10)
+    if (n > 0 && n <= 10000) {
+      return '第' + numberToChinese(n)
+    }
+    return num + suffix
+  })
 
   // Restore protected spans.
   work = work.replace(/\x00(\d+)\x00/g, (_, i) => protectedSpans[parseInt(i, 10)] || '')
@@ -1070,7 +1433,17 @@ async function* translateStream(original, config, signal, llm, currentModel) {
           const cacheKey = hashKey(strippedNouns, language, provider)
           const cached = cacheGet(cacheKey)
           if (cached !== undefined) {
-            const finalText = localizePunctuation(reinsertNouns(reinsertCode(cached, spans), nounSpans))
+            const finalText = localizePunctuation(
+              localizeBrackets(
+                localizeNumbers(
+                  convertAbbreviations(
+                    convertOrdinals(
+                      reinsertNouns(reinsertCode(cached, spans), nounSpans)
+                    )
+                  )
+                )
+              )
+            )
             yield { ...chunk, block: { ...chunk.block, text: finalText } }
             break
           }
@@ -1102,10 +1475,24 @@ async function* translateStream(original, config, signal, llm, currentModel) {
           }
 
           // Step 7: Post-process the translation:
-          //  a. Localize English punctuation to Chinese (., ? ! → 。？！)
-          //  b. Reinsert proper noun placeholders
-          //  c. Reinsert code placeholders
-          const finalText = localizePunctuation(reinsertNouns(reinsertCode(translated, spans), nounSpans))
+          //  a. Convert ordinal numbers (1st → 第一, 2nd → 第二)
+          //  b. Convert English abbreviations (etc. → 等等, e.g. → 例如)
+          //  c. Localize number formats (1,000 → 1000, $100 → 100美元)
+          //  d. Convert brackets/quotes to full-width (() → （）)
+          //  e. Localize English punctuation to Chinese (., ? ! → 。？！)
+          //  f. Reinsert proper noun placeholders
+          //  g. Reinsert code placeholders
+          const finalText = localizePunctuation(
+            localizeBrackets(
+              localizeNumbers(
+                convertAbbreviations(
+                  convertOrdinals(
+                    reinsertNouns(reinsertCode(translated, spans), nounSpans)
+                  )
+                )
+              )
+            )
+          )
 
           // Step 8: Cache the result for future lookups.
           cacheSet(cacheKey, translated)
