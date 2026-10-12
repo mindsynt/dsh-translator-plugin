@@ -225,52 +225,6 @@ async function translateText(provider, text, targetLanguage, timeoutMs, signal) 
 }
 
 /**
- * Process-Lifetime translation cache: identical text under the same
- * provider/model/language is translated once, so retries, replays, and
- * repeated blocks do not re-invoke the translation service. Bounded so a
- * long session cannot grow it without limit (oldest entries evicted).
- */
-const TRANSLATION_CACHE_MAX = 500
-const translationCache = new Map()
-
-function cacheKey(provider, model, targetLanguage, text) {
-  return `${provider}\u0001${model ?? ''}\u0001${targetLanguage}\u0001${text}`
-}
-
-/**
- * Translate `text`, returning a cached result when the same inputs recur.
- * On failure the result is not cached, so a transient provider error can
- * succeed on a later occurrence. Cache misses are serialized per key so
- * concurrent identical requests do not duplicate the underlying call.
- * @param translate - underlying translation function (free engine or LLM).
- */
-async function cachedTranslate(provider, model, targetLanguage, text, translate) {
-  if (!text) return ''
-  const key = cacheKey(provider, model, targetLanguage, text)
-  const existing = translationCache.get(key)
-  if (existing !== undefined) {
-    // A pending in-flight promise: await its settlement; errors propagate.
-    return existing
-  }
-  const task = Promise.resolve().then(() => translate(text)).then((result) => {
-    translationCache.set(key, result)
-    if (translationCache.size > TRANSLATION_CACHE_MAX) {
-      // Evict the oldest entry (Map preserves insertion order).
-      const oldest = translationCache.keys().next().value
-      if (oldest !== undefined && oldest !== key) translationCache.delete(oldest)
-    }
-    return result
-  }, (error) => {
-    // Do not cache failures; drop the pending marker so a retry can re-run.
-    translationCache.delete(key)
-    throw error
-  })
-  // Store the in-flight promise so a concurrent caller awaits the same call.
-  translationCache.set(key, task)
-  return task
-}
-
-/**
  * Cache of model id → provider route, built once by scanning the LLM runtime's
  * registered providers and their advertised models. Used when the user picks a
  * concrete translation model: its owning provider route is looked up so the
@@ -367,9 +321,13 @@ async function* translateStream(original, config, signal, llm, currentModel) {
 
   for await (const chunk of original) {
     switch (chunk.type) {
-      case 'block-start':
       case 'text-delta':
       case 'reasoning-delta': {
+        // Buffer text/reasoning deltas per block so the full text is known at
+        // block-end before deciding whether to translate. block-start is NOT
+        // buffered: it is yielded immediately (default case) so non-translated
+        // blocks (tool-call, image, …) keep their natural start→delta→end order
+        // instead of having their deltas precede their block-start.
         let entry = buffers.get(chunk.index)
         if (!entry) {
           entry = { chunks: [], text: '' }
@@ -418,14 +376,10 @@ async function* translateStream(original, config, signal, llm, currentModel) {
               model = currentModel.model
             }
             const isFreeEngine = provider === 'bing' || provider === 'google'
-            // Cache per (provider, model, language, text) so retries, replays,
-            // and repeated blocks do not re-invoke the translation service.
-            const runTranslate = (m) => cachedTranslate(
-              provider, m, language, stripped,
-              (text) => isFreeEngine
-                ? translateText(provider, text, language, config.timeoutMs, signal)
-                : translateWithLlm(llm, provider, m || DEFAULT_MODEL, text, language, config.timeoutMs, signal),
-            )
+            // Direct translation (no cache): each block is translated on demand.
+            const runTranslate = (m) => isFreeEngine
+              ? translateText(provider, stripped, language, config.timeoutMs, signal)
+              : translateWithLlm(llm, provider, m || DEFAULT_MODEL, stripped, language, config.timeoutMs, signal)
             let translated
             try {
               translated = await runTranslate(model)
