@@ -1,6 +1,15 @@
 /** Self-contained host plugin: intercepts llm/stream to translate model output.
  *  Supports Bing/Google free APIs (direct HTTP) and DeepSeek models (via LLM runtime). */
 
+import { appendFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+
+const DEBUG_LOG = join(homedir(), 'dsh-translator-debug.log')
+function debug(msg) {
+  try { appendFileSync(DEBUG_LOG, `${new Date().toISOString()} ${msg}\n`) } catch { /* ignore */ }
+}
+
 const BING_ENDPOINT = 'https://edge.microsoft.com/translate/translatetext'
 const GOOGLE_ENDPOINT = 'https://translate.googleapis.com/translate_a/single'
 const DEFAULT_MODEL = 'deepseek-flash'
@@ -38,6 +47,11 @@ export const Config = z.object({
   translateOutput: z.boolean().default(true).volatile(),
   translateThinking: z.boolean().default(true).volatile(),
   timeoutMs: z.natural().min(100).max(60000).default(10000).volatile(),
+  // Per-request segment size for long blocks: a block longer than this is split
+  // (at paragraph/sentence/whitespace boundaries), each segment translated, and
+  // joined back. This is NOT a hard skip limit — there is no upper cap on block
+  // length. Lower it for providers with small request limits; raise it to make
+  // fewer, larger translation calls.
   maxTextChars: z.natural().min(2).default(4000).volatile(),
 })
 
@@ -185,6 +199,66 @@ function reinsertCode(translated, spans) {
   // Remove any placeholder text that survived (defensive) before appending.
   result = result.replace(/\[\[CODE\d+\]\]/g, '')
   return result + tail
+}
+
+/** Split `text` into chunks of at most `chunkSize` characters, preferring to
+ * break at paragraph, sentence, or whitespace boundaries so each chunk is a
+ * self-contained, translatable unit. Returns the chunks in order.
+ *
+ * Used to translate arbitrarily long blocks without a hard length cap: a long
+ * block is split, each segment translated, and the results joined. */
+function splitText(text, chunkSize) {
+  if (text.length <= chunkSize) return [text]
+  const chunks = []
+  let start = 0
+  while (start < text.length) {
+    if (start + chunkSize >= text.length) { chunks.push(text.slice(start)); break }
+    const window = text.slice(start, start + chunkSize)
+    // Prefer the last paragraph break, then sentence end, then whitespace.
+    let cut = -1
+    const para = window.lastIndexOf('\n\n')
+    if (para !== -1) cut = para + 2
+    else {
+      const nl = window.lastIndexOf('\n')
+      if (nl !== -1) cut = nl + 1
+      else {
+        const sent = Math.max(
+          window.lastIndexOf('。'), window.lastIndexOf('！'), window.lastIndexOf('？'),
+          window.lastIndexOf('.'), window.lastIndexOf('!'), window.lastIndexOf('?'))
+        if (sent !== -1) cut = sent + 1
+        else {
+          const sp = window.lastIndexOf(' ')
+          if (sp !== -1) cut = sp + 1
+          else cut = chunkSize
+        }
+      }
+    }
+    chunks.push(text.slice(start, start + cut))
+    start += cut
+  }
+  return chunks
+}
+
+/** Translate `text` in order, splitting it into provider-sized segments first so
+ * there is no upper length limit: each segment is translated independently and
+ * the results are joined. A segment failure leaves that segment in the original
+ * language so one bad chunk does not drop the whole block.
+ * @param translate - function translating one segment string to the target language.
+ */
+async function translateLong(translate, text, chunkSize) {
+  if (!text) return ''
+  const segments = splitText(text, chunkSize)
+  if (segments.length === 1) return translate(text)
+  const out = []
+  for (const segment of segments) {
+    try {
+      out.push(await translate(segment))
+    } catch (_e) {
+      // Keep the original segment on failure so the rest still translates.
+      out.push(segment)
+    }
+  }
+  return out.join('')
 }
 
 /** Call the free translation API (bing/google) and return the translated text. */
@@ -348,10 +422,11 @@ async function* translateStream(original, config, signal, llm, currentModel) {
         const text = entry?.text ?? ''
         const shouldTranslate =
           text &&
-          text.length <= config.maxTextChars &&
           blockType &&
           ((blockType === 'text' && config.translateOutput) ||
            (blockType === 'reasoning' && config.translateThinking))
+
+        debug(`block-end idx=${chunk.index} type=${blockType} textlen=${text.length} chunkSize=${config.maxTextChars} out=${config.translateOutput} think=${config.translateThinking} shouldTranslate=${!!shouldTranslate}`)
 
         if (shouldTranslate) {
           try {
@@ -376,10 +451,13 @@ async function* translateStream(original, config, signal, llm, currentModel) {
               model = currentModel.model
             }
             const isFreeEngine = provider === 'bing' || provider === 'google'
-            // Direct translation (no cache): each block is translated on demand.
-            const runTranslate = (m) => isFreeEngine
-              ? translateText(provider, stripped, language, config.timeoutMs, signal)
-              : translateWithLlm(llm, provider, m || DEFAULT_MODEL, stripped, language, config.timeoutMs, signal)
+            // Translate the (possibly long) block in provider-sized segments so
+            // there is no upper length cap. maxTextChars is the per-request
+            // segment size, NOT a hard skip limit.
+            const translateSegment = (seg, m) => isFreeEngine
+              ? translateText(provider, seg, language, config.timeoutMs, signal)
+              : translateWithLlm(llm, provider, m || DEFAULT_MODEL, seg, language, config.timeoutMs, signal)
+            const runTranslate = (m) => translateLong((seg) => translateSegment(seg, m), stripped, config.maxTextChars)
             let translated
             try {
               translated = await runTranslate(model)
@@ -396,11 +474,13 @@ async function* translateStream(original, config, signal, llm, currentModel) {
             }
 
             const finalText = reinsertCode(translated, spans)
+            debug(`  translate ok idx=${chunk.index} type=${blockType} finalTextlen=${finalText.length}`)
             const deltaType = blockType === 'reasoning' ? 'reasoning-delta' : 'text-delta'
             yield { type: deltaType, index: chunk.index, text: finalText }
             yield { ...chunk, block: { ...chunk.block, text: finalText } }
-          } catch (_e) {
+          } catch (e) {
             // Translation failed — flush original buffered chunks.
+            debug(`  translate FAILED idx=${chunk.index} type=${blockType}: ${e?.message || e}`)
             for (const original of entry.chunks) yield original
             yield chunk
           }
@@ -443,6 +523,7 @@ function snapshot(config) {
 export const inject = ['llm']
 
 export function apply(ctx, config) {
+  debug(`apply called; llm=${typeof ctx.get('llm')}`)
   const llm = ctx.get('llm')
 
   // Re-entrancy guard: prevent waterfall recursion when translateWithLlm
@@ -450,9 +531,10 @@ export function apply(ctx, config) {
   let inStream = false
 
   ctx.on('llm/stream', (options, next) => {
+    debug(`llm/stream hit; provider=${options.provider} model=${options.model} inStream=${inStream}`)
     // Re-read volatile config on every stream so live settings edits apply.
     const cfg = snapshot(config)
-    if (!cfg.translateOutput && !cfg.translateThinking) return next()
+    if (!cfg.translateOutput && !cfg.translateThinking) { debug('  skipped: both toggles off'); return next() }
     if (inStream) return next() // Skip re-entrant calls from translation LLM
 
     // Follow the current stream's provider/model so model translation uses
