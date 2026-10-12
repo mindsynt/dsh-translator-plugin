@@ -36,6 +36,11 @@ export const Config = z.object({
   // 'auto' (or under the 'auto' provider) follows the current conversation's model.
   model: z.string().default('auto').volatile(),
   targetLanguage: z.string().default('auto').volatile(),
+  // Mirror of the client UI locale, pushed by the settings form so
+  // `targetLanguage: 'auto'` resolves to the interface language (what the user
+  // actually reads) instead of the host process LANG. Not user-editable; the
+  // form keeps it in sync. Absent/'auto' falls back to process env.
+  interfaceLanguage: z.string().default('auto').volatile(),
   translateOutput: z.boolean().default(true).volatile(),
   translateThinking: z.boolean().default(true).volatile(),
   timeoutMs: z.natural().min(100).max(60000).default(10000).volatile(),
@@ -47,13 +52,19 @@ export const Config = z.object({
   maxTextChars: z.natural().min(2).default(4000).volatile(),
 })
 
-/** Resolve 'auto' to a concrete language code from the system locale. */
-function resolveLanguage(lang) {
-  if (lang === 'auto') {
-    const locale = process.env.LANG || process.env.LC_ALL || process.env.LANGUAGE || 'en'
-    return locale.replace('_', '-').split('.')[0].split(',')[0]
-  }
-  return lang
+/** Resolve 'auto' to a concrete language code. Prefers the client-pushed
+ *  interfaceLanguage (what the user actually reads) over the host process
+ *  locale, which is often a server default unrelated to the UI. 'C'/'POSIX'
+ *  is the POSIX default, not a language — translating "to C" makes the model
+ *  echo the input, so it falls back to English. */
+function resolveLanguage(lang, interfaceLanguage) {
+  if (lang !== 'auto') return lang
+  const picked = interfaceLanguage && interfaceLanguage !== 'auto'
+    ? interfaceLanguage
+    : (process.env.LANG || process.env.LC_ALL || process.env.LANGUAGE || 'en')
+  const tag = picked.replace('_', '-').split('.')[0].split(',')[0]
+  if (/^(c|posix)$/i.test(tag)) return 'en'
+  return tag
 }
 
 /** Normalize language tag for the given provider. */
@@ -66,6 +77,39 @@ function normalizeLanguage(tag, provider) {
     return provider === 'google' ? 'zh-TW' : 'zh-Hant'
   }
   return tag
+}
+
+/** Best-effort, conservative prose-language detection by Unicode script.
+ *  Returns a 2-letter code ONLY when the script unambiguously identifies a
+ *  language in this plugin's target set; returns null otherwise so callers
+ *  never skip a translation they should have run. Latin-script languages
+ *  (en/fr/de/es) cannot be told apart by script, so Latin-only prose returns
+ *  null — it is always translated, accepting a rare same-language no-op rather
+ *  than risk skipping e.g. a French→English translation. */
+function proseLanguage(text) {
+  if (!text) return null
+  let han = 0, kana = 0, hangul = 0
+  for (const ch of text) {
+    const c = ch.codePointAt(0)
+    if (c >= 0x4E00 && c <= 0x9FFF) han++        // CJK Unified Ideographs
+    else if (c >= 0x3040 && c <= 0x30FF) kana++  // Hiragana + Katakana
+    else if (c >= 0xAC00 && c <= 0xD7AF) hangul++ // Hangul Syllables
+  }
+  if (han === 0 && kana === 0 && hangul === 0) return null // Latin-only: can't confirm
+  if (kana > 0) return 'ja'   // kana present -> Japanese
+  if (hangul > 0) return 'ko' // hangul present -> Korean
+  return 'zh'                 // han only, no kana/hangul -> Chinese
+}
+
+/** Map a target language tag to its CJK family ('zh'/'ja'/'ko') for the
+ *  same-language passthrough decision, or null for Latin-script targets
+ *  (en/fr/de/es) which proseLanguage can't confirm by script alone. */
+function languageFamily(tag) {
+  const l = (tag || '').toLowerCase()
+  if (l.startsWith('zh')) return 'zh'
+  if (l.startsWith('ja')) return 'ja'
+  if (l.startsWith('ko')) return 'ko'
+  return null
 }
 
 /** Build the HTTP request for the given provider. */
@@ -401,10 +445,11 @@ async function* translateStream(original, config, signal, llm, currentModel) {
   // Per-block buffers for blocks we WILL translate (full text known at
   // block-end). Blocks we will NOT translate go in `passthrough` and their
   // deltas yield immediately, so streaming stays real-time when a block type
-  // is disabled (e.g. translateOutput off).
-  const buffers = new Map()      // index -> { chunks: [...], text: '' }
+  // is disabled (e.g. translateOutput off) — and a same-language block is
+  // moved to `passthrough` incrementally once detected, so it streams live.
+  const buffers = new Map()      // index -> { chunks: [...], text, han/kana/hangul/latin, decided }
   const passthrough = new Set()  // indices whose deltas stream through unchanged
-  const language = resolveLanguage(config.targetLanguage)
+  const language = resolveLanguage(config.targetLanguage, config.interfaceLanguage)
 
   for await (const chunk of original) {
     switch (chunk.type) {
@@ -417,7 +462,8 @@ async function* translateStream(original, config, signal, llm, currentModel) {
           (blockType === 'text' && config.translateOutput) ||
           (blockType === 'reasoning' && config.translateThinking)
         if (willTranslate) {
-          if (!buffers.has(chunk.index)) buffers.set(chunk.index, { chunks: [], text: '' })
+          if (!buffers.has(chunk.index))
+            buffers.set(chunk.index, { chunks: [], text: '', han: 0, kana: 0, hangul: 0, latin: 0, decided: false })
         } else {
           passthrough.add(chunk.index)
           // Flush any deltas buffered before this (out-of-order) block-start.
@@ -435,11 +481,40 @@ async function* translateStream(original, config, signal, llm, currentModel) {
         if (!entry) {
           // No block-start seen (delta-only protocol): buffer defensively so a
           // later block-end can still translate by block type.
-          entry = { chunks: [], text: '' }
+          entry = { chunks: [], text: '', han: 0, kana: 0, hangul: 0, latin: 0, decided: false }
           buffers.set(chunk.index, entry)
         }
         entry.chunks.push(chunk)
         entry.text += chunk.text
+        // Incremental same-language detection: once the buffered prose is
+        // confidently the target language (CJK dominates), switch this block
+        // to live passthrough instead of holding it to block-end — so a
+        // same-language conversation (the common case) streams in real time.
+        // Tally only this delta's chars (O(delta)) and decide once.
+        if (!entry.decided) {
+          for (const ch of chunk.text) {
+            const c = ch.codePointAt(0)
+            if (c >= 0x4E00 && c <= 0x9FFF) entry.han++
+            else if (c >= 0x3040 && c <= 0x30FF) entry.kana++
+            else if (c >= 0xAC00 && c <= 0xD7AF) entry.hangul++
+            else if ((c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A)) entry.latin++
+          }
+          const cjk = entry.han + entry.kana + entry.hangul
+          if (cjk >= 8 && cjk >= entry.latin) {
+            entry.decided = true
+            const fam = entry.kana > 0 ? 'ja' : entry.hangul > 0 ? 'ko' : 'zh'
+            if (fam === languageFamily(language)) {
+              // Same language as the target -> flush the buffered deltas so far
+              // and stream the rest of this block live (no translation call).
+              for (const c of entry.chunks) yield c
+              passthrough.add(chunk.index)
+              buffers.delete(chunk.index)
+            }
+            // else: confidently a different language -> keep buffering; the
+            // block-end path translates it (the same-language skip won't fire
+            // since the detected family differs from the target).
+          }
+        }
         break
       }
 
@@ -477,6 +552,18 @@ async function* translateStream(original, config, signal, llm, currentModel) {
               // 'auto' — follow the current conversation entirely.
               provider = currentModel.provider
               model = currentModel.model
+            }
+            // Same-language skip: if the prose is confidently already in the
+            // target language, don't waste a translation call or show a fake,
+            // identical "translation" — flush the original block verbatim.
+            // Conservative (see proseLanguage): only CJK targets where the
+            // script unambiguously matches; Latin targets always translate.
+            const detected = proseLanguage(stripped)
+            if (detected !== null
+              && normalizeLanguage(detected, provider) === normalizeLanguage(language, provider)) {
+              for (const original of entry.chunks) yield original
+              yield chunk
+              break
             }
             const isFreeEngine = provider === 'bing' || provider === 'google'
             // Translate the (possibly long) block in provider-sized segments so
@@ -539,6 +626,7 @@ function snapshot(config) {
     provider: config.provider.get(),
     model: config.model.get(),
     targetLanguage: config.targetLanguage.get(),
+    interfaceLanguage: config.interfaceLanguage.get(),
     translateOutput: config.translateOutput.get(),
     translateThinking: config.translateThinking.get(),
     timeoutMs: config.timeoutMs.get(),

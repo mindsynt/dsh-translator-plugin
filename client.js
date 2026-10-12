@@ -6,7 +6,7 @@ window.__ModuleLoader__.load({
   id: '@local/model-translator',
   factory(require) {
     const React = require('react');
-    const { useState, useEffect } = React;
+    const { useState, useEffect, useRef } = React;
     const h = React.createElement;
 
     /* ── locale dictionaries (inline so no resource resolution is needed) ── */
@@ -152,9 +152,16 @@ window.__ModuleLoader__.load({
       const [saved,  setSaved]  = useState(false);
       const [error,  setError]  = useState(null);
 
-      /* sync draft state when the accepted snapshot changes */
+      /* sync draft state when the accepted snapshot's EDITABLE fields change.
+         A background write to a non-editable field (the auto-synced
+         interfaceLanguage mirror) must NOT clobber the user's in-progress
+         edits, so we compare only the editable signature and skip otherwise. */
+      const lastSig = useRef(null);
       useEffect(() => {
         const v = snapshot.value ?? {};
+        const sig = [v.provider, v.model, v.targetLanguage, v.translateOutput, v.translateThinking].join('\u0001');
+        if (sig === lastSig.current) return;
+        lastSig.current = sig;
         setProvider(v.provider ?? 'auto');
         setModel(v.model ?? 'auto');
         setLanguage(v.targetLanguage ?? 'auto');
@@ -322,6 +329,27 @@ window.__ModuleLoader__.load({
 
         const cf     = ctx.get('configForms');
         const form   = cf ? cf.get('model-translator') : null;
+
+        /* Keep the host's `interfaceLanguage` mirror in sync with the live UI
+           locale so `targetLanguage: 'auto'` resolves to the interface language
+           (what the user reads), not the host process LANG. Pushed silently —
+           no save toast — and only when the active locale actually changes. */
+        if (form && typeof ctx.locale?.getLocale === 'function') {
+          ctx.effect(() => {
+            let last = undefined;
+            const push = () => {
+              const snap = form.getSnapshot();
+              if (snap.status !== 'ready' || !snap.writable) return;
+              const active = ctx.locale.getLocale()?.active;
+              if (!active || active === last) return;
+              last = active;
+              form.mutate([{ op: 'set', path: ['interfaceLanguage'], value: active }]).catch(() => {});
+            };
+            push();
+            const off = typeof ctx.locale.subscribe === 'function' ? ctx.locale.subscribe(push) : (() => {});
+            return () => { off(); };
+          }, 'model-translator: interface language sync');
+        }
 
         /* Load the available model catalog once, and refresh on topology /
            settings changes so the dropdown stays current. */

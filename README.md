@@ -47,7 +47,7 @@ Every field is `.volatile()`, so the settings panel is live-editable and
 | --- | --- | --- |
 | `provider` | `auto` | `auto` / `bing` / `google` |
 | `model` | `auto` | Model routes only. `auto` follows the conversation's model |
-| `targetLanguage` | `auto` | `auto` resolves from `LANG` / `LC_ALL` / `LANGUAGE` |
+| `targetLanguage` | `auto` | `auto` follows the interface language (pushed by the client); falls back to the host `LANG` |
 | `translateOutput` | `true` | |
 | `translateThinking` | `true` | |
 | `timeoutMs` | `10000` | Bounded to 100–60000 |
@@ -75,6 +75,12 @@ per provider — `zh-Hans` / `zh-Hant` for Bing, `zh-CN` / `zh-TW` for Google.
 - **Concurrent streams are safe.** Because the guard is per-call, not a
   process-wide flag, teammate, subagent and workflow streams running at the
   same time are each translated independently.
+- **Same-language blocks stream live.** Once a block's buffered prose is
+  confidently the target language (by script; CJK targets only), it switches
+  to live passthrough — no wasted call, no fake identical "translation", and the
+  text streams in real time instead of dumping at block-end. Latin-script
+  targets (en/fr/de/es) can't be told apart by script, so they always translate
+  (at block-end).
 - **Free engines are firewalled.** Bing/Google requests use
   `credentials: 'omit'` and treat any redirect as an error.
 
@@ -153,7 +159,7 @@ entirely.
 | --- | --- | --- |
 | `provider` | `auto` | `auto` / `bing` / `google` |
 | `model` | `auto` | 仅模型路由。`auto` 跟随当前对话的模型 |
-| `targetLanguage` | `auto` | `auto` 从 `LANG` / `LC_ALL` / `LANGUAGE` 解析 |
+| `targetLanguage` | `auto` | `auto` 跟随界面语言（由 client 推送）；回退到 host `LANG` |
 | `translateOutput` | `true` | |
 | `translateThinking` | `true` | |
 | `timeoutMs` | `10000` | 限制在 100–60000 |
@@ -175,6 +181,8 @@ entirely.
   async-local 存储识别），因此翻译不会去翻译翻译本身——也不会误杀并发的真实流。
 - **并发流是安全的。** 守卫是按调用而非进程级开关，因此同时运行的 teammate、
   subagent、workflow 流各自独立翻译。
+- **同语言块实时流式。** 一旦块内已缓冲的文字被确认为目标语言（按文字脚本判定；仅 CJK 目标），即切换为实时放行——
+  不浪费调用、不显示假翻译，且文字逐字流出而非攒到块尾一次性放出。拉丁脚本目标（en/fr/de/es）无法靠脚本区分，因此始终翻译（在块尾）。
 - **免费引擎被隔离。** Bing/Google 请求使用 `credentials: 'omit'`，任何重定向都视为
   错误。
 
