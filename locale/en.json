@@ -1,0 +1,41 @@
+{
+  "meta": {
+    "title": "Model Translator",
+    "description": "Auto-translate model output and thinking (reasoning) to any language. Supports Bing, Google, and model-based translation."
+  },
+  "settings": {
+    "title": "Model Translator Settings",
+    "subtitle": "Automatically translates model output and thinking (reasoning) during streaming. If translation fails, the original text is shown.",
+    "provider": "Translation Provider",
+    "providerHintFree": "Free translation API — no model inference, text is sent to the translation service.",
+    "providerHintAuto": "Translates with a dsh-loaded model. Defaults to the current conversation's model, or pick one below.",
+    "model": "Translation Model",
+    "modelHintAuto": "Choose \"Auto\" to follow the current conversation's model, or pick a specific model below to override.",
+    "modelAuto": "Auto (follow current conversation model)",
+    "modelLoading": "Loading available models…",
+    "modelLoadFailed": "Could not load the model list.",
+    "targetLanguage": "Target Language",
+    "targetLanguageHint": "Use \"Auto\" to follow the interface language, or select a specific language.",
+    "translateOutput": "Translate model output",
+    "translateThinking": "Translate thinking (reasoning)",
+    "providerAuto": "Auto (follow current conversation model)",
+    "providerBing": "Bing Translate (free)",
+    "providerGoogle": "Google Translate (free)",
+    "langAuto": "Auto (follow interface language)",
+    "langZh": "Chinese (Simplified)",
+    "langEn": "English",
+    "langJa": "Japanese",
+    "langKo": "Korean",
+    "langFr": "French",
+    "langDe": "German",
+    "langEs": "Spanish",
+    "loading": "Loading settings…",
+    "unavailable": "Settings are not available. Please ensure the plugin is properly configured.",
+    "formUnavailable": "Configuration form is not available. Edit the bundle's cordis.patch.yml directly.",
+    "saving": "Saving…",
+    "save": "Save Settings",
+    "saved": "Settings saved!",
+    "saveFailed": "Save failed. Please try again.",
+    "saveFailedGeneric": "Save failed."
+  }
+}

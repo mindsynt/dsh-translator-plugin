@@ -1,0 +1,9 @@
+- insert:
+    - id: model-translator
+      name: '@local/model-translator'
+      config:
+        provider: auto
+        model: auto
+        targetLanguage: auto
+        translateOutput: true
+        translateThinking: true

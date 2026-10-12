@@ -1,0 +1,41 @@
+{
+  "meta": {
+    "title": "模型翻译",
+    "description": "自动翻译模型输出和思考（推理）到任意语言。支持 Bing、Google 和模型翻译。"
+  },
+  "settings": {
+    "title": "模型翻译设置",
+    "subtitle": "在流式输出时自动翻译模型输出和思考（推理）。翻译失败时显示原文。",
+    "provider": "翻译服务",
+    "providerHintFree": "免费翻译 API —— 不调用模型，文本会发送到翻译服务。",
+    "providerHintAuto": "使用 dsh 已加载的模型翻译。默认跟随当前对话的模型，也可在下方选一个具体模型。",
+    "model": "翻译模型",
+    "modelHintAuto": "选择“自动”跟随当前对话的模型，或在下方选一个具体模型来覆盖。",
+    "modelAuto": "自动（跟随当前对话模型）",
+    "modelLoading": "正在加载可用模型…",
+    "modelLoadFailed": "无法加载模型列表。",
+    "targetLanguage": "目标语言",
+    "targetLanguageHint": "选择“自动”跟随界面语言，或选择一个具体语言。",
+    "translateOutput": "翻译模型输出",
+    "translateThinking": "翻译模型思考（推理）",
+    "providerAuto": "自动（跟随当前对话模型）",
+    "providerBing": "Bing 翻译（免费）",
+    "providerGoogle": "Google 翻译（免费）",
+    "langAuto": "自动（跟随界面语言）",
+    "langZh": "中文（简体）",
+    "langEn": "英语",
+    "langJa": "日语",
+    "langKo": "韩语",
+    "langFr": "法语",
+    "langDe": "德语",
+    "langEs": "西班牙语",
+    "loading": "正在加载设置…",
+    "unavailable": "设置不可用。请确保插件配置正确。",
+    "formUnavailable": "配置表单不可用。请直接编辑 bundle 的 cordis.patch.yml。",
+    "saving": "保存中…",
+    "save": "保存设置",
+    "saved": "设置已保存！",
+    "saveFailed": "保存失败，请重试。",
+    "saveFailedGeneric": "保存失败。"
+  }
+}

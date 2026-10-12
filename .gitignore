@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+
+# Package manager caches & install state
+.pnpm-store/
+package-lock.json
+yarn.lock
+npm-shrinkwrap.json
+
+# Node error dumps
+npm-debug.log*
+yarn-error.log*
+
+# OS & editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
