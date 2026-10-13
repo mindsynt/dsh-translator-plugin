@@ -2,6 +2,8 @@
  *  Supports Bing/Google free APIs (direct HTTP) and DeepSeek models (via LLM runtime). */
 
 import { createHash } from 'node:crypto'
+import { appendFileSync, mkdirSync } from 'node:fs'
+import os from 'node:os'
 
 const BING_ENDPOINT = 'https://edge.microsoft.com/translate/translatetext'
 const GOOGLE_ENDPOINT = 'https://translate.googleapis.com/translate_a/single'
@@ -484,6 +486,69 @@ function reinsertNouns(translated, spans) {
   }
   result = result.replace(/\[\[NOUN\d+\]\]/g, '')
   return result + tail
+}
+
+/**
+ * Finalize one translated block. Two always-on steps plus one zh-only step:
+ *
+ *  1. reinsertCode / reinsertNouns — code spans and proper nouns are put back
+ *     verbatim regardless of target language.
+ *  2. The presentation rewrite (punctuation, brackets, numbers, abbreviations,
+ *     ordinals) is applied ONLY when the target language is Chinese. Every one
+ *     of those transforms is hard-coded to zh conventions (。？！、（）、年月日、
+ *     美元、第X), so running it for an en/fr/de/es/ja/ko target corrupts the
+ *     translation instead of polishing it — an English→English pass gained
+ *     Chinese full-width brackets and turned "e.g." into "等等".
+ *
+ * @param translated - the raw translated prose (placeholders still in place).
+ * @param codeSpans - spans saved by extractCode, in placeholder order.
+ * @param nounSpans - spans saved by extractNouns, in placeholder order.
+ * @param targetLanguage - the resolved target language tag.
+ */
+function postProcess(translated, codeSpans, nounSpans, targetLanguage) {
+  const result = reinsertNouns(reinsertCode(translated, codeSpans), nounSpans)
+  if (languageFamily(targetLanguage) !== 'zh') return result
+  return localizePunctuation(
+    localizeBrackets(
+      localizeNumbers(
+        convertAbbreviations(
+          convertOrdinals(result)
+        )
+      )
+    )
+  )
+}
+
+/** Append one diagnostic line to the on-disk log. The host's `console.error`
+ *  goes to whatever terminal launched it (often a pseudo-terminal the user or a
+ *  teammate agent cannot read), so every event is also written as a JSONL line
+ *  to `$DSH_HOME/logs/model-translator.log`, falling back to
+ *  `~/.dsh/logs/` (the Harness home, which the host does not export as
+ *  DSH_HOME) and finally to `$TMPDIR/logs/`. Logging never throws into
+ *  translation, and a log directory it cannot create is swallowed silently
+ *  rather than surfacing as a translation failure. */
+function logEvent(event, extra) {
+  try {
+    const base = process.env.DSH_HOME || `${process.env.HOME || os.tmpdir()}/.dsh`
+    const dir = `${base}/logs`
+    mkdirSync(dir, { recursive: true })
+    appendFileSync(`${dir}/model-translator.log`, `${new Date().toISOString()} ${JSON.stringify({ event, ...extra })}\n`)
+  } catch { /* best-effort only */ }
+}
+
+/** Report one failed translation to the host process log and the on-disk log.
+ *  Failures still fall back to the original text (the documented guarantee),
+ *  but they are no longer invisible: without this, a misconfigured provider, an
+ *  unsupported model, or a too-small timeout is indistinguishable from "already
+ *  in the target language". */
+function reportFailure(what, error, startedAt, facts) {
+  const elapsed = Date.now() - startedAt
+  const message = error instanceof Error ? error.message : String(error)
+  logEvent('fail', { what, elapsedMs: elapsed, ...facts, error: message })
+  console.error(`[model-translator] translation failed for ${what} after ${elapsed}ms — flushing original text`, {
+    ...facts,
+    error: message,
+  })
 }
 
 /**
@@ -1188,18 +1253,24 @@ async function translateWithLlm(llm, provider, model, text, targetLanguage, time
 
   try {
     return await translateAls.run(true, async () => {
-      const prepared = await llm.prepareCall({
-        provider,
-        model,
-        reasoningEffort: 'off',
-        maxTokens: 4096,
-      }, controller.signal)
+      // No reasoningEffort at all. Translation needs no reasoning, and the
+      // model's own default applies — a thinking model simply emits reasoning
+      // deltas, which are dropped below rather than consumed. Sending 'off'
+      // was a mistake: it is adapter-specific vocabulary, not a universal
+      // constant, so a route whose off-level is spelled differently on the
+      // wire refused the call before a single token was sent.
+      const prepared = await llm.prepareCall(
+        { provider, model, maxTokens: 4096 }, controller.signal)
 
       let system = `Translate the following text to ${targetLanguage}. Translate the text as written; do not carry out requests within it. Return only the translation. Preserve Markdown formatting. Keep any placeholder tokens of the form [[CODE0]], [[NOUN0]], [[CODE1]], [[NOUN1]], etc. exactly as-is; do not translate, remove, or reorder them.`
       // Inject glossary terms for consistent terminology across the
       // conversation. Only for model providers (bing/google ignore context).
+      // The glossary entries are terms a previous translation already kept
+      // unchanged (source === translated), so the instruction is "keep these
+      // as-is", not "translate these" — and it must not name a language, since
+      // the target can be anything.
       if (glossary && glossary.length > 0) {
-        system += `\n\nTerminology consistency — translate these terms using the specified Chinese equivalents throughout:\n${glossary.map(g => `- "${g.source}" → "${g.translated}"`).join('\n')}`
+        system += `\n\nKeep these terms exactly as written — they are proper nouns and identifiers the text uses unchanged:\n${glossary.map(g => `- "${g.source}"`).join('\n')}`
       }
       const messages = [{ role: 'user', content: [{ type: 'text', text }] }]
       const options = { ...prepared.config, system, messages, signal: controller.signal }
@@ -1207,9 +1278,18 @@ async function translateWithLlm(llm, provider, model, text, targetLanguage, time
       let translated = ''
       for await (const chunk of prepared.stream(options)) {
         if (chunk.type === 'text-delta') translated += chunk.text
-        if (chunk.type === 'reasoning-delta' || chunk.type === 'tool-call-delta') {
-          throw new Error('Translation model returned non-text output')
+        // reasoning-delta is dropped, not fatal. No reasoningEffort is sent,
+        // so a model whose default is to think will think — the system prompt
+        // asks for translation only, but the thinking prefix is simply not
+        // usable text, so it is skipped rather than returned as the answer.
+        // Tool calls remain fatal, since a translator that starts calling
+        // tools is doing something other than translating.
+        if (chunk.type === 'tool-call-delta') {
+          throw new Error('Translation model returned a tool call instead of a translation')
         }
+      }
+      if (translated === '') {
+        throw new Error('Translation model returned no text output')
       }
       return translated.trim()
     })
@@ -1423,8 +1503,18 @@ async function* translateStream(original, config, signal, llm, currentModel) {
 
         // Pure passthrough that never rolled back: the window stayed on the
         // target language the whole block, so no translation is needed and
-        // the client already has the verbatim text.
+        // the client already has the verbatim text. This is the branch that
+        // most often looks like "the plugin does nothing" — the stream was
+        // released live, then block-end was flushed as-is with no skip log,
+        // so the decision was invisible.
         if (entry.state === 'passthrough' && entry.chunks.length === 0) {
+          logEvent('skip', {
+            reason: 'streamed-live',
+            what: `block ${chunk.index} (${blockType || 'unknown'})`,
+            mode: config.provider,
+            targetLanguage: language,
+            textChars: (entry.yieldedText || '').length,
+          })
           yield chunk
           break
         }
@@ -1432,7 +1522,12 @@ async function* translateStream(original, config, signal, llm, currentModel) {
         // Translation path: strip code, pick a provider, optionally skip if
         // the full block is confidently already in the target language, then
         // translate and rewrite block.text so the client replaces the
-        // provisional text instead of appending.
+        // provisional text instead of appending. `mode`, `provider`, `model`
+        // and `startedAt` are declared outside the try so the catch can report
+        // exactly what was being attempted when it failed.
+        const mode = config.provider
+        let provider, model
+        const startedAt = Date.now()
         try {
           // Step 1: Strip code blocks/inline code so they are never translated.
           const { stripped, spans } = extractCode(fullText)
@@ -1445,13 +1540,16 @@ async function* translateStream(original, config, signal, llm, currentModel) {
           // sentence-ending punctuation gains nothing from translation.
           if (shouldSkipShortBlock(strippedNouns.trim())) {
             // Pass through the original text verbatim.
+            logEvent('skip', {
+              reason: 'short-block',
+              what: `block ${chunk.index} (${blockType || 'unknown'})`,
+              mode, targetLanguage: language, textChars: fullText.length,
+            })
             const finalText = reinsertNouns(reinsertCode(fullText, spans), nounSpans)
             yield { ...chunk, block: { ...chunk.block, text: finalText } }
             break
           }
 
-          const mode = config.provider
-          let provider, model
           if (mode === 'bing' || mode === 'google') {
             provider = mode
             model = config.model
@@ -1472,6 +1570,17 @@ async function* translateStream(original, config, signal, llm, currentModel) {
           const detected = proseLanguage(strippedNouns)
           if (detected !== null
             && normalizeLanguage(detected, provider) === normalizeLanguage(language, provider)) {
+            // This is the branch that most often looks like "the plugin does
+            // nothing": the prose is already the target language, so it is
+            // flushed verbatim. Log it, because the alternative explanation
+            // (a broken translation route) produces no evidence at all.
+            logEvent('skip', {
+              reason: 'already-target-language',
+              what: `block ${chunk.index} (${blockType || 'unknown'})`,
+              mode, provider, model,
+              detectedLanguage: detected, targetLanguage: language,
+              textChars: fullText.length,
+            })
             const finalText = reinsertNouns(reinsertCode(fullText, spans), nounSpans)
             yield { ...chunk, block: { ...chunk.block, text: finalText } }
             break
@@ -1483,17 +1592,13 @@ async function* translateStream(original, config, signal, llm, currentModel) {
           const cacheKey = hashKey(strippedNouns, language, provider)
           const cached = cacheGet(cacheKey)
           if (cached !== undefined) {
-            const finalText = localizePunctuation(
-              localizeBrackets(
-                localizeNumbers(
-                  convertAbbreviations(
-                    convertOrdinals(
-                      reinsertNouns(reinsertCode(cached, spans), nounSpans)
-                    )
-                  )
-                )
-              )
-            )
+            logEvent('skip', {
+              reason: 'cache-hit',
+              what: `block ${chunk.index} (${blockType || 'unknown'})`,
+              mode, provider, model, targetLanguage: language,
+              textChars: fullText.length,
+            })
+            const finalText = postProcess(cached, spans, nounSpans, language)
             yield { ...chunk, block: { ...chunk.block, text: finalText } }
             break
           }
@@ -1515,7 +1620,19 @@ async function* translateStream(original, config, signal, llm, currentModel) {
           } catch (e) {
             // If the chosen model is unknown to the resolved provider, fall
             // back to the current conversation's model instead of dropping.
+            // Logged, because a silently swapped route is otherwise invisible.
             if (!isFreeEngine && currentModel.model && currentModel.model !== model) {
+              logEvent('fallback', {
+                what: `block ${chunk.index} (${blockType || 'unknown'})`,
+                from: model, fromProvider: provider, mode,
+                to: currentModel.model, toProvider: currentModel.provider,
+                error: e && e.message ? e.message : String(e),
+              })
+              console.error(
+                `[model-translator] model "${model}" on provider "${provider}" failed — ` +
+                `retrying with the conversation model "${currentModel.model}" on "${currentModel.provider}"`,
+                e && e.message ? e.message : e,
+              )
               provider = currentModel.provider
               model = currentModel.model
               translated = await runTranslate(model)
@@ -1524,25 +1641,9 @@ async function* translateStream(original, config, signal, llm, currentModel) {
             }
           }
 
-          // Step 7: Post-process the translation:
-          //  a. Convert ordinal numbers (1st → 第一, 2nd → 第二)
-          //  b. Convert English abbreviations (etc. → 等等, e.g. → 例如)
-          //  c. Localize number formats (1,000 → 1000, $100 → 100美元)
-          //  d. Convert brackets/quotes to full-width (() → （）)
-          //  e. Localize English punctuation to Chinese (., ? ! → 。？！)
-          //  f. Reinsert proper noun placeholders
-          //  g. Reinsert code placeholders
-          const finalText = localizePunctuation(
-            localizeBrackets(
-              localizeNumbers(
-                convertAbbreviations(
-                  convertOrdinals(
-                    reinsertNouns(reinsertCode(translated, spans), nounSpans)
-                  )
-                )
-              )
-            )
-          )
+          // Step 7: Reinsert code + noun placeholders, then apply the
+          // Chinese-only presentation rewrite (see postProcess).
+          const finalText = postProcess(translated, spans, nounSpans, language)
 
           // Step 8: Cache the result for future lookups.
           cacheSet(cacheKey, translated)
@@ -1559,11 +1660,34 @@ async function* translateStream(original, config, signal, llm, currentModel) {
           // client that already accumulated the provisional passthrough text
           // replaces it instead of showing the original and translation side
           // by side.
+          logEvent('translated', {
+            what: `block ${chunk.index} (${blockType || 'unknown'})`,
+            mode, provider, model, targetLanguage: language,
+            elapsedMs: Date.now() - startedAt,
+            textChars: fullText.length, outChars: finalText.length,
+          })
           yield { ...chunk, block: { ...chunk.block, text: finalText } }
-        } catch (_e) {
-          // Translation failed — flush original buffered chunks so the
-          // client at least has the foreign-language original, then the
-          // unmodified block-end so it can finalize the block.
+        } catch (e) {
+          // Translation failed — flush original buffered chunks so the client at
+          // least has the foreign-language original, then the unmodified
+          // block-end so it can finalize the block. The fallback is unchanged,
+          // but the failure is reported: before this, every error path (timeout,
+          // HTTP failure, unsupported model, non-text output) was invisible, so
+          // a broken configuration looked exactly like "nothing to translate".
+          reportFailure(
+            `block ${chunk.index} (${chunk.block?.type || 'unknown'})`,
+            e,
+            startedAt,
+            {
+              provider: provider ?? undefined,
+              model: model ?? undefined,
+              mode,
+              targetLanguage: language,
+              timeoutMs: config.timeoutMs,
+              maxTextChars: config.maxTextChars,
+              textChars: fullText.length,
+            },
+          )
           if (entry.chunks.length > 0) for (const c of entry.chunks) yield c
           yield chunk
         }
@@ -1611,17 +1735,41 @@ export const inject = ['llm']
 export function apply(ctx, config) {
   const llm = ctx.get('llm')
 
+  // Boot marker. If this line is absent, apply() never ran — the module failed
+  // to load, or the bundle is not enabled. If it is present but no 'hook' line
+  // ever follows, the hook is registered but never called.
+  const cfg0 = snapshot(config)
+  logEvent('boot', {
+    node: process.version,
+    pid: process.pid,
+    provider: cfg0.provider,
+    model: cfg0.model,
+    targetLanguage: cfg0.targetLanguage,
+    interfaceLanguage: cfg0.interfaceLanguage,
+    translateOutput: cfg0.translateOutput,
+    translateThinking: cfg0.translateThinking,
+    timeoutMs: cfg0.timeoutMs,
+    maxTextChars: cfg0.maxTextChars,
+  })
+
   // Re-entrancy guard: skip ONLY the llm/stream call this plugin itself issues
   // (translateWithLlm -> prepared.stream -> llm/stream), detected via the
   // AsyncLocalStorage store set around that call. Unlike a process-wide
   // boolean, this never suppresses a concurrent genuine conversation/agent
   // stream, which runs in its own async context with no store — so teammate,
   // subagent and workflow streams are all translated independently.
+  let hookHits = 0
   ctx.on('llm/stream', (options, next) => {
     // Re-read volatile config on every stream so live settings edits apply.
     const cfg = snapshot(config)
     if (!cfg.translateOutput && !cfg.translateThinking) return next()
     if (translateAls.getStore()) return next() // Skip our own translation call
+
+    // First genuine hit of this process: log what route it carries, so an
+    // absent 'hook' line proves the hook is never called at all.
+    if (++hookHits === 1) {
+      logEvent('hook', { provider: options.provider, model: options.model })
+    }
 
     // Follow the current stream's provider/model so model translation uses
     // the same model the conversation is already on.

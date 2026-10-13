@@ -28,30 +28,37 @@ verbatim.
 
 ### Providers
 
+There are four `provider` values — the two free engines plus two model modes:
+
 | Provider | What translates |
 | --- | --- |
-| `auto` | A dsh-loaded model. Follows the current conversation's provider and model by default, or pins one you pick from the catalog. |
+| `auto` | The dsh-loaded model the conversation is currently on. No separate model pick; provider and model both follow the stream. |
+| `model` | A dsh-loaded model you pick below. The provider is looked up from that model's catalog group. |
 | `bing` | The Microsoft Bing Translate free HTTP endpoint. No model inference. |
 | `google` | The Google Translate free HTTP endpoint. No model inference. |
 
-`auto` stays inside credentials you already loaded; `bing` and `google` are free
-but send the text to a third-party service. Pick the tradeoff you want — the
-`model` field is ignored entirely for the free engines.
+`auto` and `model` stay inside credentials you already loaded; `bing` and `google`
+are free but send the text to a third-party service. Pick the tradeoff you want —
+the `model` field is ignored entirely for the free engines. Model routes translate
+with `reasoningEffort: 'off'` and `maxTokens: 4096`, so an adapter that does not
+advertise an `off` effort will refuse the call (the original text is flushed).
 
 ### Settings
 
 Every field is `.volatile()`, so the settings panel is live-editable and
-`apply()` re-reads the current values on the next stream — no remount.
+`apply()` re-reads the current values on the next stream — no remount. The form
+exposes all of them, including the two advanced ones:
 
 | Setting | Default | Notes |
 | --- | --- | --- |
-| `provider` | `auto` | `auto` / `bing` / `google` |
+| `provider` | `auto` | `auto` / `model` / `bing` / `google` |
 | `model` | `auto` | Model routes only. `auto` follows the conversation's model |
 | `targetLanguage` | `auto` | `auto` follows the interface language (pushed by the client); falls back to the host `LANG` |
 | `translateOutput` | `true` | |
 | `translateThinking` | `true` | |
-| `timeoutMs` | `10000` | Bounded to 100–60000 |
+| `timeoutMs` | `10000` | Per translation request, bounded to 100–60000. Raise it for model routes — a `maxTextChars`-sized segment often takes longer than 10 s |
 | `maxTextChars` | `4000` | Per-request segment size; longer blocks are split and translated in full (no hard cap) |
+| `interfaceLanguage` | `auto` | Not editable. Mirrors the UI locale so `targetLanguage: auto` resolves to what you actually read, not the host `LANG` |
 
 The form offers `auto`, `zh`, `en`, `ja`, `ko`, `fr`, `de`, `es`; the config
 itself accepts any language tag, so `zh-TW` or `pt-BR` works if you edit
@@ -64,10 +71,33 @@ per provider — `zh-Hans` / `zh-Hant` for Bing, `zh-CN` / `zh-TW` for Google.
   `[[CODE0]]`-style placeholders before the text leaves the process, then
   reinserted verbatim. If a translation drops a placeholder, the code is
   appended back at the end — it is never lost.
-- **Translation failures are invisible.** Any error — a timeout, an HTTP
-  failure, a malformed response, or a translation model that starts emitting
-  reasoning — flushes the original text unchanged. A failed segment fails the
-  whole block, so you never get a half-translated answer.
+- **Translation failures never break the stream.** Any error — a timeout, an
+  HTTP failure, a malformed response, an unsupported model, or a translation
+  that comes back empty — flushes the original text unchanged. Every failure is
+  also written to the host process log with the provider, model, target
+  language, timeout, and elapsed time, so "it did not translate" is diagnosable
+  instead of indistinguishable from "nothing to translate". A failed segment
+  fails the whole block, so you never get a half-translated answer.
+- **Reasoning output does not break a translation.** The plugin asks the
+  adapter for `reasoningEffort: 'off'` so the translator does not think, but
+  `'off'` is adapter vocabulary, not a universal constant: a hand-declared
+  OpenAI-compat route whose wire spelling is `"none"` (sensenova) advertises no
+  effort levels at all, and the LLM service refuses the call before a single
+  token is sent. So the id is probed per route and omitted when unsupported,
+  and any `reasoning-delta` that still arrives is dropped rather than fatal —
+  only tool calls and a completely empty response fail the translation.
+- **Every decision is logged to a file.** All events — `boot`, `capability`
+  (the route's advertised effort vocabulary), `hook`,
+  `translated`, `skip` (`short-block`, `streamed-live`,
+  `already-target-language`, `cache-hit`), `fallback` and `fail` — are appended
+  as JSONL to `$DSH_HOME/logs/model-translator.log` (falling back to
+  `~/.dsh/logs/` — the host does not export `DSH_HOME` — and finally to
+  `$TMPDIR/logs/`). The host's `console.error` goes to whatever terminal
+  launched it, which is often a pseudo-terminal nobody else can read; the file
+  survives restarts and stays readable by anyone in the process. A missing
+  `boot` line means `apply()` never ran (the module failed to load, or the
+  bundle is disabled); a `boot` line with no `hook` line means the hook was
+  registered but never called. Logging never throws into translation.
 - **No translation recursion.** The re-entrancy guard targets only the
   `llm/stream` call this plugin itself issues (detected via an async-local
   store), so translation never translates itself — and never suppresses a
@@ -81,6 +111,15 @@ per provider — `zh-Hans` / `zh-Hant` for Bing, `zh-CN` / `zh-TW` for Google.
   text streams in real time instead of dumping at block-end. Latin-script
   targets (en/fr/de/es) can't be told apart by script, so they always translate
   (at block-end).
+- **Translated blocks do not stream token by token.** A block that will be
+  translated accumulates all of its deltas and only yields the rewritten
+  `block-end`, so the text appears in one piece after the translation call
+  returns. That delay is real latency, not a hang — and a `timeoutMs` that is
+  too small shows up as exactly this: a block that never translates.
+- **Chinese presentation fixes only apply to Chinese.** Punctuation, brackets,
+  dates, currency, thousand separators, abbreviations and ordinals are rewritten
+  to Chinese conventions only when the target language is Chinese. For every
+  other target the translation is returned as the service produced it.
 - **Free engines are firewalled.** Bing/Google requests use
   `credentials: 'omit'` and treat any redirect as an error.
 
@@ -141,29 +180,35 @@ entirely.
 
 ### 翻译服务
 
+`provider` 一共有四种取值 —— 两个免费引擎，加上两种模型模式：
+
 | 服务 | 谁来做翻译 |
 | --- | --- |
-| `auto` | 一个 dsh 已加载的模型。默认跟随当前对话的 provider 与模型，也可指定目录中的某个模型。 |
+| `auto` | 当前对话正在使用的那个 dsh 已加载模型。不另选模型，provider 与模型都跟随这条流。 |
+| `model` | 你自己在下方指定的 dsh 已加载模型。provider 按该模型在目录中的分组查找。 |
 | `bing` | 微软 Bing Translate 免费 HTTP 端点。不调用模型。 |
 | `google` | Google Translate 免费 HTTP 端点。不调用模型。 |
 
-`auto` 待在你已加载的凭据之内；`bing` 与 `google` 免费，但会把文本发给第三方服务。
-按你的取舍选择 —— `model` 字段对免费引擎完全不起作用。
+`auto` 与 `model` 都在你已加载的凭据之内；`bing` 与 `google` 免费，但会把文本
+发给第三方服务。按你的取舍选择 —— `model` 字段对免费引擎完全不起作用。模型路由
+以 `reasoningEffort: 'off'`、`maxTokens: 4096` 发起翻译，因此不声明 `off` 级别的
+适配器会拒绝这次调用（此时会放出原文）。
 
 ### 设置
 
 每个字段都是 `.volatile()`，因此设置面板可实时编辑，`apply()` 在下一条流上重新
-读取当前值 —— 无需重新挂载插件。
+读取当前值 —— 无需重新挂载插件。表单包含全部字段，包括两个高级项：
 
 | 设置项 | 默认值 | 说明 |
 | --- | --- | --- |
-| `provider` | `auto` | `auto` / `bing` / `google` |
+| `provider` | `auto` | `auto` / `model` / `bing` / `google` |
 | `model` | `auto` | 仅模型路由。`auto` 跟随当前对话的模型 |
 | `targetLanguage` | `auto` | `auto` 跟随界面语言（由 client 推送）；回退到 host `LANG` |
 | `translateOutput` | `true` | |
 | `translateThinking` | `true` | |
-| `timeoutMs` | `10000` | 限制在 100–60000 |
+| `timeoutMs` | `10000` | 单次翻译请求，限制在 100–60000。模型路由建议调大 —— 一个 `maxTextChars` 大小的分段常常比 10 秒更久 |
 | `maxTextChars` | `4000` | 每段请求大小；更长的块会被切分并完整翻译（无硬上限） |
+| `interfaceLanguage` | `auto` | 不可编辑。镜像 UI 语言，让 `targetLanguage: auto` 解析成你实际阅读的语言，而不是 host `LANG` |
 
 表单提供 `auto`、`zh`、`en`、`ja`、`ko`、`fr`、`de`、`es`；配置本身接受任意语言
 标签，所以直接改 `cordis.patch.yml` 时用 `zh-TW` 或 `pt-BR` 也可以。简繁中文按
@@ -174,15 +219,35 @@ entirely.
 - **代码从不被翻译。** 围栏代码块与行内代码在文本离开进程前被替换成 `[[CODE0]]`
   形式的占位符，翻译完再原样插回。如果翻译把占位符弄丢了，代码会被追加回结尾 ——
   代码不会丢。
-- **翻译失败是无形的。** 任何错误 —— 超时、HTTP 失败、响应格式异常、或者翻译模型
-  开始吐出推理内容 —— 都会把原文原样冲出。某段翻译失败会让整块回退原文，所以你
-  永远不会看到一个翻译了一半的答案。
+- **翻译失败不会弄断流。** 任何错误 —— 超时、HTTP 失败、响应格式异常、模型不受
+  支持、或者整条翻译返回空 —— 都会把原文原样冲出。每一次失败同时写入
+  host 进程日志，带上 provider、模型、目标语言、超时值和耗时，所以「没有翻译」是
+  可查的，而不是和「本来就不用翻译」无法区分。某段翻译失败会让整块回退原文，所以
+  你永远不会看到一个翻译了一半的答案。
+- **推理内容不会弄坏翻译。** 插件会向适配器请求 `reasoningEffort: 'off'` 以避免翻译模型思考，
+  但 `'off'` 是各适配器自己的词汇，不是通用常量：一个手工声明的 OpenAI 兼容路由，
+  其线上的关闭拼写是 `"none"`（sensenova），就不声明任何 effort 级别，LLM 服务会在
+  发出任何 token 之前直接拒绝这次调用。因此这个 id 会按路由探测，不支持时干脆不传；
+  即使仍然回来的 `reasoning-delta` 也只会被丢弃，不会报错 —— 只有工具调用和完全空的
+  响应才会让翻译失败。
+- **每个决策都落盘。** 所有事件 —— `boot`、`capability`（该路由声明的 effort 词汇表）、`hook`、`translated`、`skip`
+  （`short-block` / `streamed-live` / `already-target-language` / `cache-hit`）、
+  `fallback`、`fail` —— 都以 JSONL 追加到 `$DSH_HOME/logs/model-translator.log`
+  （回退到 `~/.dsh/logs/` —— host 并没有导出 `DSH_HOME` —— 最后回退到 `$TMPDIR/logs/`）。host 的 `console.error` 只会写进启动它的那个终端，
+  往往是没人读得到的伪终端；文件跨重启保留，且进程内任何人均可读。没有 `boot`
+  行说明 `apply()` 从未执行（模块加载失败或 bundle 被禁用）；有 `boot` 但没有
+  `hook` 说明 hook 注册了却从未被调用。写日志绝不打断翻译。
 - **没有翻译递归。** 重入守卫只针对插件自己发起的那次 `llm/stream` 调用（用
   async-local 存储识别），因此翻译不会去翻译翻译本身——也不会误杀并发的真实流。
 - **并发流是安全的。** 守卫是按调用而非进程级开关，因此同时运行的 teammate、
   subagent、workflow 流各自独立翻译。
 - **同语言块实时流式。** 一旦块内已缓冲的文字被确认为目标语言（按文字脚本判定；仅 CJK 目标），即切换为实时放行——
   不浪费调用、不显示假翻译，且文字逐字流出而非攒到块尾一次性放出。拉丁脚本目标（en/fr/de/es）无法靠脚本区分，因此始终翻译（在块尾）。
+- **要翻译的块不会逐字流式。** 会被翻译的块先把所有增量攒齐，只在 `block-end`
+  时放出改写后的块，所以文字是在翻译调用返回后一次性出现的。这段等待是真实的
+  延迟，不是卡死 —— `timeoutMs` 设得太小正好就是这个表现：块永远不翻译。
+- **中文排版修正只对中文生效。** 标点、括号、日期、货币、千分位、缩写和序数只在
+  目标语言是中文时改写成中文习惯。其他目标语言一律按翻译服务返回的原文输出。
 - **免费引擎被隔离。** Bing/Google 请求使用 `credentials: 'omit'`，任何重定向都视为
   错误。
 

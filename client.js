@@ -28,6 +28,11 @@ window.__ModuleLoader__.load({
       targetLanguageHint: 'Use \u201cAuto\u201d to follow the interface language, or select a specific language.',
       translateOutput: 'Translate model output',
       translateThinking: 'Translate thinking (reasoning)',
+      advanced: 'Advanced',
+      timeoutMs: 'Translation timeout (ms)',
+      timeoutMsHint: 'Per translation request, 100\u201360000 ms. Raise it for model routes \u2014 a 4000-char segment often exceeds 10s and the block is then flushed untranslated.',
+      maxTextChars: 'Segment size (chars)',
+      maxTextCharsHint: 'Longer blocks are split into segments of this size, translated, and joined back. Raise for fewer calls, lower for providers with small request limits.',
       providerAuto: 'Auto (follow current conversation model)',
       providerModel: 'Model translation engine (pick a model)',
       providerBing: 'Bing Translate (free)',
@@ -65,6 +70,11 @@ window.__ModuleLoader__.load({
       targetLanguageHint: '选择“自动”跟随界面语言，或选择一个具体语言。',
       translateOutput: '翻译模型输出',
       translateThinking: '翻译模型思考（推理）',
+      advanced: '高级选项',
+      timeoutMs: '翻译超时（毫秒）',
+      timeoutMsHint: '单次翻译请求的超时，100–60000 毫秒。模型路由建议调大：4000 字符的分段经常超过 10 秒，超时后该块会原样放出（即看起来「没翻译」）。',
+      maxTextChars: '分段大小（字符）',
+      maxTextCharsHint: '更长的块会按此大小切分、分段翻译后再拼回。调大则调用更少，调小则适合请求上限较低的翻译服务。',
       providerAuto: '自动（跟随当前对话模型）',
       providerModel: '模型翻译引擎（选择模型）',
       providerBing: 'Bing 翻译（免费）',
@@ -147,6 +157,8 @@ window.__ModuleLoader__.load({
       const [language,          setLanguage]          = useState(value.targetLanguage    ?? 'auto');
       const [translateOutput,   setTranslateOutput]   = useState(value.translateOutput   ?? true);
       const [translateThinking, setTranslateThinking] = useState(value.translateThinking ?? true);
+      const [timeoutMs,     setTimeoutMs]     = useState(value.timeoutMs     ?? 10000);
+      const [maxTextChars,  setMaxTextChars]  = useState(value.maxTextChars  ?? 4000);
 
       const [saving, setSaving] = useState(false);
       const [saved,  setSaved]  = useState(false);
@@ -159,7 +171,8 @@ window.__ModuleLoader__.load({
       const lastSig = useRef(null);
       useEffect(() => {
         const v = snapshot.value ?? {};
-        const sig = [v.provider, v.model, v.targetLanguage, v.translateOutput, v.translateThinking].join('\u0001');
+        const sig = [v.provider, v.model, v.targetLanguage, v.translateOutput, v.translateThinking,
+          v.timeoutMs, v.maxTextChars].join('\u0001');
         if (sig === lastSig.current) return;
         lastSig.current = sig;
         setProvider(v.provider ?? 'auto');
@@ -167,6 +180,8 @@ window.__ModuleLoader__.load({
         setLanguage(v.targetLanguage ?? 'auto');
         setTranslateOutput(v.translateOutput ?? true);
         setTranslateThinking(v.translateThinking ?? true);
+        setTimeoutMs(v.timeoutMs ?? 10000);
+        setMaxTextChars(v.maxTextChars ?? 4000);
         setError(null);
       }, [snapshot.value]);
 
@@ -184,11 +199,24 @@ window.__ModuleLoader__.load({
         try {
           // model is only meaningful in 'model' mode (pick a loaded model).
           const isModelMode = provider === 'model';
+          // Clamp the numeric fields to the schema's declared range before
+          // sending, so a stray keystroke cannot make the server refuse the
+          // whole write (every field is validated together).
+          const toNum = (raw, fallback) => {
+            const n = Math.round(Number(raw));
+            return Number.isFinite(n) ? n : fallback;
+          };
+          const timeout  = Math.min(60000, Math.max(100, toNum(timeoutMs, 10000)));
+          const maxChars = Math.max(2, toNum(maxTextChars, 4000));
+          setTimeoutMs(timeout);
+          setMaxTextChars(maxChars);
           const ops = [
             { op: 'set', path: ['provider'],        value: provider },
             { op: 'set', path: ['targetLanguage'],  value: language },
             { op: 'set', path: ['translateOutput'], value: translateOutput },
             { op: 'set', path: ['translateThinking'], value: translateThinking },
+            { op: 'set', path: ['timeoutMs'],       value: timeout },
+            { op: 'set', path: ['maxTextChars'],    value: maxChars },
           ];
           if (isModelMode) ops.push({ op: 'set', path: ['model'], value: model });
 
@@ -304,6 +332,44 @@ window.__ModuleLoader__.load({
             disabled,
           }),
           h('span', {}, t('translateThinking')),
+        ),
+
+        /* ── Advanced: timeout + segment size ──
+           Both were previously unreachable from the form, so every user was
+           stuck on the 10000 ms / 4000 char defaults — which is exactly the
+           combination that times out on a model route and silently flushes
+           the original text. */
+        h('div', { style: { display: 'flex', flexDirection: 'column', gap: '6px' } },
+          h('p', { style: { margin: 0, fontWeight: 600, fontSize: '12px', color: '#888' } }, t('advanced')),
+          h('div', { style: { display: 'flex', gap: '12px', flexWrap: 'wrap' } },
+            h('div', { style: { flex: '1 1 220px', display: 'flex', flexDirection: 'column', gap: '6px' } },
+              h('label', { style: S.label }, t('timeoutMs')),
+              h('input', {
+                type: 'number',
+                value: timeoutMs,
+                min: 100,
+                max: 60000,
+                step: 500,
+                onChange: (e) => { setTimeoutMs(e.target.value); setSaved(false); },
+                disabled,
+                style: S.input,
+              }),
+              h('p', { style: S.desc }, t('timeoutMsHint')),
+            ),
+            h('div', { style: { flex: '1 1 220px', display: 'flex', flexDirection: 'column', gap: '6px' } },
+              h('label', { style: S.label }, t('maxTextChars')),
+              h('input', {
+                type: 'number',
+                value: maxTextChars,
+                min: 2,
+                step: 100,
+                onChange: (e) => { setMaxTextChars(e.target.value); setSaved(false); },
+                disabled,
+                style: S.input,
+              }),
+              h('p', { style: S.desc }, t('maxTextCharsHint')),
+            ),
+          ),
         ),
 
         /* ── Status messages ── */
