@@ -7,6 +7,7 @@
         targetLanguage: auto
         translateOutput: true
         translateThinking: true
+        translateMode: block
         # Offline engine (CTranslate2 + Opus-MT). The en-zh model ships
         # bundled with the plugin so a fresh install translates offline
         # without a download. Turn offlineAutoDownload on to fetch other
