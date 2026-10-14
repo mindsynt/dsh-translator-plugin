@@ -28,6 +28,10 @@ window.__ModuleLoader__.load({
       targetLanguageHint: 'Use \u201cAuto\u201d to follow the interface language, or select a specific language.',
       translateOutput: 'Translate model output',
       translateThinking: 'Translate thinking (reasoning)',
+      translateMode: 'Translation Mode',
+      translateModeHint: 'Choose how text is translated during streaming. "Block" buffers the whole block then translates at block-end (higher quality). "Sentence" translates each sentence as it arrives (lower latency, text appears as translated).',
+      translateModeBlock: 'Block (translate at block-end)',
+      translateModeSentence: 'Sentence (translate as it arrives)',
       advanced: 'Advanced',
       timeoutMs: 'Translation timeout (ms)',
       timeoutMsHint: 'Per translation request, 100\u201360000 ms. Raise it for model routes \u2014 a 4000-char segment often exceeds 10s and the block is then flushed untranslated.',
@@ -83,6 +87,10 @@ window.__ModuleLoader__.load({
       targetLanguageHint: '选择“自动”跟随界面语言，或选择一个具体语言。',
       translateOutput: '翻译模型输出',
       translateThinking: '翻译模型思考（推理）',
+      translateMode: '翻译模式',
+      translateModeHint: '选择流式输出时的翻译方式。「整块」缓冲整个块，在块结束时翻译（质量更高）。「逐句」在每个句子完成后立即翻译（延迟更低，译文逐句出现）。',
+      translateModeBlock: '整块（块结束时翻译）',
+      translateModeSentence: '逐句（句子完成后翻译）',
       advanced: '高级选项',
       timeoutMs: '翻译超时（毫秒）',
       timeoutMsHint: '单次翻译请求的超时，100–60000 毫秒。模型路由建议调大：4000 字符的分段经常超过 10 秒，超时后该块会原样放出（即看起来「没翻译」）。',
@@ -136,6 +144,15 @@ window.__ModuleLoader__.load({
       }
     }
     const PROVIDER_VALUES = ['auto', 'model', 'bing', 'google', 'opus'];
+
+    function translateModeLabel(t, value) {
+      switch (value) {
+        case 'block': return t('translateModeBlock');
+        case 'sentence': return t('translateModeSentence');
+        default: return value;
+      }
+    }
+    const MODE_VALUES = ['block', 'sentence'];
 
     /* Supported offline language pairs. Opus-MT models are per-pair and
        directional, so this is what the dropdown offers when a user wants to
@@ -199,6 +216,7 @@ window.__ModuleLoader__.load({
       const [language,          setLanguage]          = useState(value.targetLanguage    ?? 'auto');
       const [translateOutput,   setTranslateOutput]   = useState(value.translateOutput   ?? true);
       const [translateThinking, setTranslateThinking] = useState(value.translateThinking ?? true);
+      const [translateMode,     setTranslateMode]     = useState(value.translateMode     ?? 'block');
       const [timeoutMs,     setTimeoutMs]     = useState(value.timeoutMs     ?? 10000);
       const [maxTextChars,  setMaxTextChars]  = useState(value.maxTextChars  ?? 4000);
       const [offlinePair,   setOfflinePair]   = useState(value.offlinePair   ?? 'auto');
@@ -217,7 +235,7 @@ window.__ModuleLoader__.load({
       useEffect(() => {
         const v = snapshot.value ?? {};
         const sig = [v.provider, v.model, v.targetLanguage, v.translateOutput, v.translateThinking,
-          v.timeoutMs, v.maxTextChars, v.offlinePair, v.offlineAutoDownload].join('\u0001');
+          v.translateMode, v.timeoutMs, v.maxTextChars, v.offlinePair, v.offlineAutoDownload].join('\u0001');
         if (sig === lastSig.current) return;
         lastSig.current = sig;
         setProvider(v.provider ?? 'auto');
@@ -225,6 +243,7 @@ window.__ModuleLoader__.load({
         setLanguage(v.targetLanguage ?? 'auto');
         setTranslateOutput(v.translateOutput ?? true);
         setTranslateThinking(v.translateThinking ?? true);
+        setTranslateMode(v.translateMode ?? 'block');
         setTimeoutMs(v.timeoutMs ?? 10000);
         setMaxTextChars(v.maxTextChars ?? 4000);
         setOfflinePair(v.offlinePair ?? 'auto');
@@ -262,6 +281,7 @@ window.__ModuleLoader__.load({
             { op: 'set', path: ['targetLanguage'],  value: language },
             { op: 'set', path: ['translateOutput'], value: translateOutput },
             { op: 'set', path: ['translateThinking'], value: translateThinking },
+            { op: 'set', path: ['translateMode'], value: translateMode },
             { op: 'set', path: ['timeoutMs'],       value: timeout },
             { op: 'set', path: ['maxTextChars'],    value: maxChars },
             { op: 'set', path: ['offlinePair'],     value: offlinePair },
@@ -411,6 +431,20 @@ window.__ModuleLoader__.load({
             disabled,
           }),
           h('span', {}, t('translateThinking')),
+        ),
+
+        /* ── Translation Mode ── */
+        h('div', { style: { display: 'flex', flexDirection: 'column', gap: '6px' } },
+          h('label', { style: S.label }, t('translateMode')),
+          h('select', {
+            value: translateMode,
+            onChange: (e) => { setTranslateMode(e.target.value); setSaved(false); },
+            disabled,
+            style: S.input,
+          },
+            MODE_VALUES.map((v) => h('option', { key: v, value: v }, translateModeLabel(t, v))),
+          ),
+          h('p', { style: S.desc }, t('translateModeHint')),
         ),
 
         /* ── Advanced: timeout + segment size ──

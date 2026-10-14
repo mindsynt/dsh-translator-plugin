@@ -423,6 +423,15 @@ export const Config = z.object({
   interfaceLanguage: z.string().default('auto').volatile(),
   translateOutput: z.boolean().default(true).volatile(),
   translateThinking: z.boolean().default(true).volatile(),
+  // Translation timing: how and when text is translated during streaming.
+  //  'block'    — buffer the entire block, translate at block-end. Higher
+  //               translation quality (full context), but the user sees
+  //               original text flash then replacement.
+  //  'sentence' — buffer to sentence boundary, translate each sentence as
+  //               it completes. Lower latency, text appears as translated.
+  //               Translation quality is slightly lower (less context per
+  //               call), but the user never sees untranslated text.
+  translateMode: z.union(['block', 'sentence']).default('block').volatile(),
   timeoutMs: z.natural().min(100).max(60000).default(10000).volatile(),
   // Per-request segment size for long blocks: a block longer than this is split
   // (at paragraph/sentence/whitespace boundaries), each segment translated, and
@@ -1756,6 +1765,140 @@ const LANG_FLUSH_THRESHOLD = 8
  *  1-2 letter code snippet in a CJK block does not trigger a rollback. */
 const LANG_ROLLBACK_THRESHOLD = 8
 
+/** Sentence-ending punctuation marks (both Latin and CJK). */
+const SENTENCE_END_CHARS = new Set(['.', '!', '?', '。', '！', '？'])
+
+/** Known English abbreviations that end with a period but are not sentence
+ *  boundaries. Checking only the word immediately before the period. */
+const ABBREVIATIONS = new Set([
+  'e.g', 'i.e', 'etc', 'approx', 'vs', 'cf', 'al', 'eg', 'ie',
+  'mr', 'mrs', 'dr', 'prof', 'sr', 'jr', 'st', 'no', 'fig', 'eq',
+  'vol', 'inc', 'ltd', 'co', 'corp', 'dept', 'est', 'gen', 'sgt',
+  'cpl', 'bft', 'cmdr', 'capt', 'pres', 'sen', 'rep',
+])
+
+/** Detect whether text before the given index looks like an abbreviation.
+ *  Checks the word immediately preceding the period for known abbreviations. */
+function isAbbreviation(text, periodIdx) {
+  const before = text.slice(Math.max(0, periodIdx - 12), periodIdx).toLowerCase()
+  const lastWord = before.split(/\s+/).pop() || ''
+  // Strip any leading punctuation (e.g. "(e.g.")
+  const cleaned = lastWord.replace(/^[^\w]+/, '')
+  return ABBREVIATIONS.has(cleaned)
+}
+
+/** Find the end index of the first complete sentence in `text`.
+ *  Returns the index just after the sentence-ending punctuation, or -1 if
+ *  no sentence boundary is found. Ignores abbreviations and sentence
+ *  ends inside code blocks (tracked via inCodeBlock state). */
+function findSentenceEnd(text, inCodeBlock) {
+  if (inCodeBlock) return -1
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]
+    if (!SENTENCE_END_CHARS.has(ch)) continue
+    // Don't treat an abbreviation period as a sentence end.
+    if (ch === '.' && isAbbreviation(text, i)) continue
+    // Must be followed by whitespace, end-of-text, or a closing bracket.
+    const next = text[i + 1]
+    if (next === undefined) return i + 1
+    if (/[\s\n\r]/.test(next)) return i + 1
+    if (/[\)\]}>»」』】]/.test(next)) return i + 1
+  }
+  return -1
+}
+
+/** Track code-block fence markers (```, ~~~) in streaming deltas.
+ *  Returns the new inCodeBlock state after processing `deltaText`.
+ *  The fence count determines whether we're inside a code block:
+ *  odd = inside, even = outside. */
+function trackCodeFence(deltaText, inCodeBlock) {
+  const fences = deltaText.match(/```/g) || []
+  if (fences.length === 0) return inCodeBlock
+  for (const f of fences) {
+    inCodeBlock = !inCodeBlock
+  }
+  return inCodeBlock
+}
+
+/** Minimum characters before we attempt sentence-boundary detection.
+ *  Too-short text is unlikely to contain a complete sentence, and
+ *  detecting on 2-3 chars risks false positives. */
+const SENTENCE_MIN_CHARS = 10
+
+/** Translate a single sentence for sentence-mode streaming.
+ *  Same pipeline as the block-end path (extractCode → extractNouns →
+ *  translate → postProcess) but on a single sentence, with caching.
+ *  Resolves provider/model the same way as the block-end path.
+ *  On failure, falls back to the original text (never breaks the stream). */
+async function translateSentence(text, config, signal, llm, currentModel, language) {
+  if (!text || text.trim() === '') return text
+
+  // Step 1: Extract code spans (protect code from translation)
+  const { stripped, spans } = extractCode(text)
+
+  // Step 2: Extract proper nouns
+  const { stripped: strippedNouns, spans: nounSpans } = extractNouns(stripped)
+
+  if (!strippedNouns.trim()) return text
+
+  // Step 3: Detect source language
+  const detected = proseLanguage(strippedNouns)
+
+  // Step 4: Resolve provider and model (same logic as block-end path)
+  const mode = config.provider
+  let provider, model
+  const isOfflineMode = mode === 'opus'
+  if (mode === 'bing' || mode === 'google' || isOfflineMode) {
+    provider = mode
+    model = config.model
+  } else if (mode === 'model') {
+    provider = (await providerForModel(llm, config.model)) ?? currentModel.provider
+    model = config.model === 'auto' ? currentModel.model : config.model
+  } else {
+    // 'auto' — follow the current conversation
+    provider = currentModel.provider
+    model = currentModel.model
+  }
+
+  // Step 5: Cache check
+  const isFreeEngine = provider === 'bing' || provider === 'google' || provider === 'opus'
+  const cacheKey = hashKey(strippedNouns, language, provider)
+  const cached = cacheGet(cacheKey)
+  if (cached !== undefined) {
+    return postProcess(cached, spans, nounSpans, language)
+  }
+
+  // Step 6: Build the translate function
+  const glossaryContext = isFreeEngine ? undefined : [...glossary]
+  const translateFn = (seg) => {
+    if (provider === 'opus') {
+      const source = detected || 'en'
+      const { pair } = resolveOfflinePair(source, language, config.offlinePair)
+      if (!pair) return Promise.resolve(seg)
+      return translateOffline(seg, pair, config, signal)
+    }
+    return isFreeEngine
+      ? translateText(provider, seg, language, config.timeoutMs, signal)
+      : translateWithLlm(llm, provider, model, seg, language, config.timeoutMs, signal, glossaryContext)
+  }
+
+  // Step 7: Translate (single sentence — no long-text splitting needed)
+  let translated
+  try {
+    translated = await translateFn(strippedNouns)
+  } catch (_e) {
+    // Fallback to original text on failure — sentence mode must degrade
+    // gracefully per-sentence so one failed translation doesn't kill the stream.
+    return text
+  }
+
+  // Step 8: Cache
+  cacheSet(cacheKey, translated)
+
+  // Step 9: Post-process (reinsert code/nouns, localize punctuation)
+  return postProcess(translated, spans, nounSpans, language)
+}
+
 /**
  * Wrap a model stream to translate text and reasoning blocks.
  *
@@ -1871,6 +2014,32 @@ async function* translateStream(original, config, signal, llm, currentModel) {
         if (entry.state === 'buffering') {
           entry.chunks.push(chunk)
           entry.text += chunk.text
+
+          // Track code fence state for sentence-mode detection.
+          if (entry.inCodeBlock === undefined) entry.inCodeBlock = false
+          entry.inCodeBlock = trackCodeFence(chunk.text, entry.inCodeBlock)
+
+          // Sentence mode: translate completed sentences as they arrive.
+          // Only attempt when outside a code block and text is long enough.
+          if (config.translateMode === 'sentence' && !entry.inCodeBlock
+            && entry.text.length >= SENTENCE_MIN_CHARS) {
+            const endIdx = findSentenceEnd(entry.text, false)
+            if (endIdx > 0) {
+              const sentence = entry.text.slice(0, endIdx)
+              entry.text = entry.text.slice(endIdx)
+              entry.chunks = []
+
+              // Translate and yield as a synthetic delta.
+              const translated = await translateSentence(
+                sentence, config, signal, llm, currentModel, language)
+              yield { type: chunk.type, index: chunk.index, text: translated }
+
+              // Track translated parts for block-end text rebuild.
+              if (!entry.translatedParts) entry.translatedParts = []
+              entry.translatedParts.push(translated)
+            }
+          }
+
           // Flush to live passthrough only when the window is confidently the
           // target language. Until then, keep buffering so a foreign block
           // (or a mixed block) is not flushed prematurely.
@@ -1944,6 +2113,29 @@ async function* translateStream(original, config, signal, llm, currentModel) {
             textChars: (entry.yieldedText || '').length,
           })
           yield chunk
+          break
+        }
+
+        // Sentence mode: if any sentences were streamed, translate remaining
+        // buffered text and rebuild block.text from all translated parts plus
+        // any passthrough text that was yielded during the stream.
+        if (config.translateMode === 'sentence' && entry.translatedParts?.length > 0) {
+          let remainingTranslated = ''
+          if (entry.text.trim()) {
+            remainingTranslated = await translateSentence(
+              entry.text, config, signal, llm, currentModel, language)
+          }
+          const finalText = entry.translatedParts.join('') +
+            (entry.yieldedText || '') + remainingTranslated
+          logEvent('translated', {
+            what: `block ${chunk.index} (${blockType || 'unknown'})`,
+            mode: config.provider,
+            translateMode: 'sentence',
+            targetLanguage: language,
+            sentences: entry.translatedParts.length,
+            textChars: fullText.length, outChars: finalText.length,
+          })
+          yield { ...chunk, block: { ...chunk.block, text: finalText } }
           break
         }
 
@@ -2173,6 +2365,7 @@ function snapshot(config) {
     interfaceLanguage: config.interfaceLanguage.get(),
     translateOutput: config.translateOutput.get(),
     translateThinking: config.translateThinking.get(),
+    translateMode: config.translateMode.get(),
     timeoutMs: config.timeoutMs.get(),
     maxTextChars: config.maxTextChars.get(),
     offlinePair: config.offlinePair.get(),
@@ -2210,6 +2403,7 @@ export function apply(ctx, config) {
     interfaceLanguage: cfg0.interfaceLanguage,
     translateOutput: cfg0.translateOutput,
     translateThinking: cfg0.translateThinking,
+    translateMode: cfg0.translateMode,
     timeoutMs: cfg0.timeoutMs,
     maxTextChars: cfg0.maxTextChars,
     offlinePair: cfg0.offlinePair,
