@@ -28,7 +28,7 @@ verbatim.
 
 ### Providers
 
-There are four `provider` values — the two free engines plus two model modes:
+There are five `provider` values — two free engines, two model modes, and one offline engine:
 
 | Provider | What translates |
 | --- | --- |
@@ -36,11 +36,13 @@ There are four `provider` values — the two free engines plus two model modes:
 | `model` | A dsh-loaded model you pick below. The provider is looked up from that model's catalog group. |
 | `bing` | The Microsoft Bing Translate free HTTP endpoint. No model inference. |
 | `google` | The Google Translate free HTTP endpoint. No model inference. |
+| `opus` | An **offline** CTranslate2 + Opus-MT model running on this machine. No network call, no API key, no credentials used. |
 
 `auto` and `model` stay inside credentials you already loaded; `bing` and `google`
-are free but send the text to a third-party service. Pick the tradeoff you want —
-the `model` field is ignored entirely for the free engines. Model routes translate
-with `reasoningEffort: 'off'` and `maxTokens: 4096`, so an adapter that does not
+are free but send the text to a third-party service; `opus` sends nothing anywhere
+but needs the model files. Pick the tradeoff you want — the `model` field is
+ignored entirely for the free and offline engines. Model routes translate with
+`reasoningEffort: 'off'` and `maxTokens: 4096`, so an adapter that does not
 advertise an `off` effort will refuse the call (the original text is flushed).
 
 ### Settings
@@ -51,13 +53,18 @@ exposes all of them, including the two advanced ones:
 
 | Setting | Default | Notes |
 | --- | --- | --- |
-| `provider` | `auto` | `auto` / `model` / `bing` / `google` |
+| `provider` | `auto` | `auto` / `model` / `bing` / `google` / `opus` |
 | `model` | `auto` | Model routes only. `auto` follows the conversation's model |
 | `targetLanguage` | `auto` | `auto` follows the interface language (pushed by the client); falls back to the host `LANG` |
 | `translateOutput` | `true` | |
 | `translateThinking` | `true` | |
-| `timeoutMs` | `10000` | Per translation request, bounded to 100–60000. Raise it for model routes — a `maxTextChars`-sized segment often takes longer than 10 s |
-| `maxTextChars` | `4000` | Per-request segment size; longer blocks are split and translated in full (no hard cap) |
+| `timeoutMs` | `10000` | Per translation request, bounded to 100–60000. Raise it for model routes — a `maxTextChars`-sized segment often takes longer than 10 s. Not used by `opus`, which has no timeout |
+| `maxTextChars` | `4000` | Per-request segment size; longer blocks are split and translated in full (no hard cap). `opus` caps segments at 2000 chars regardless |
+| `offlinePair` | `auto` | Offline only. `auto` infers the pair per block from its detected language; otherwise force a direction like `en-zh` |
+| `offlineModelDir` | *(empty)* | Offline only. Override for `$DSH_HOME/model-translator/models` |
+| `offlineThreads` | `4` | Offline only. CPU threads for the CTranslate2 backend, 1–32 |
+| `offlineBeamSize` | `4` | Offline only. Beam search width, 1–12 |
+| `offlineAutoDownload` | `true` | Offline only. Fetch the ~160 MB model per pair on first use |
 | `interfaceLanguage` | `auto` | Not editable. Mirrors the UI locale so `targetLanguage: auto` resolves to what you actually read, not the host `LANG` |
 
 The form offers `auto`, `zh`, `en`, `ja`, `ko`, `fr`, `de`, `es`; the config
@@ -180,7 +187,7 @@ entirely.
 
 ### 翻译服务
 
-`provider` 一共有四种取值 —— 两个免费引擎，加上两种模型模式：
+`provider` 一共有五种取值 —— 两个免费引擎，两种模型模式，一个离线引擎：
 
 | 服务 | 谁来做翻译 |
 | --- | --- |
@@ -188,9 +195,11 @@ entirely.
 | `model` | 你自己在下方指定的 dsh 已加载模型。provider 按该模型在目录中的分组查找。 |
 | `bing` | 微软 Bing Translate 免费 HTTP 端点。不调用模型。 |
 | `google` | Google Translate 免费 HTTP 端点。不调用模型。 |
+| `opus` | **离线**：在本机运行的 CTranslate2 + Opus-MT 模型。无网络请求、无 API key、不使用任何凭据。 |
 
 `auto` 与 `model` 都在你已加载的凭据之内；`bing` 与 `google` 免费，但会把文本
-发给第三方服务。按你的取舍选择 —— `model` 字段对免费引擎完全不起作用。模型路由
+发给第三方服务；`opus` 不往任何地方发送文本，但需要模型文件。按你的取舍选择 ——
+`model` 字段对免费与离线引擎完全不起作用。模型路由
 以 `reasoningEffort: 'off'`、`maxTokens: 4096` 发起翻译，因此不声明 `off` 级别的
 适配器会拒绝这次调用（此时会放出原文）。
 
@@ -201,13 +210,18 @@ entirely.
 
 | 设置项 | 默认值 | 说明 |
 | --- | --- | --- |
-| `provider` | `auto` | `auto` / `model` / `bing` / `google` |
+| `provider` | `auto` | `auto` / `model` / `bing` / `google` / `opus` |
 | `model` | `auto` | 仅模型路由。`auto` 跟随当前对话的模型 |
 | `targetLanguage` | `auto` | `auto` 跟随界面语言（由 client 推送）；回退到 host `LANG` |
 | `translateOutput` | `true` | |
 | `translateThinking` | `true` | |
-| `timeoutMs` | `10000` | 单次翻译请求，限制在 100–60000。模型路由建议调大 —— 一个 `maxTextChars` 大小的分段常常比 10 秒更久 |
-| `maxTextChars` | `4000` | 每段请求大小；更长的块会被切分并完整翻译（无硬上限） |
+| `timeoutMs` | `10000` | 单次翻译请求，限制在 100–60000。模型路由建议调大 —— 一个 `maxTextChars` 大小的分段常常比 10 秒更久。`opus` 不使用此项（离线推理无超时） |
+| `maxTextChars` | `4000` | 每段请求大小；更长的块会被切分并完整翻译（无硬上限）。`opus` 无论如何都把分段限制在 2000 字符 |
+| `offlinePair` | `auto` | 仅离线。`auto` 按每个块的检测语言推断语言对；也可固定方向如 `en-zh` |
+| `offlineModelDir` | *(空)* | 仅离线。覆盖 `$DSH_HOME/model-translator/models` |
+| `offlineThreads` | `4` | 仅离线。CTranslate2 后端 CPU 线程数，1–32 |
+| `offlineBeamSize` | `4` | 仅离线。束搜索宽度，1–12 |
+| `offlineAutoDownload` | `true` | 仅离线。首次使用时抓取约 160 MB 的模型 |
 | `interfaceLanguage` | `auto` | 不可编辑。镜像 UI 语言，让 `targetLanguage: auto` 解析成你实际阅读的语言，而不是 host `LANG` |
 
 表单提供 `auto`、`zh`、`en`、`ja`、`ko`、`fr`、`de`、`es`；配置本身接受任意语言

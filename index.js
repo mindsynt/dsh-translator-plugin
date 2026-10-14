@@ -1,13 +1,333 @@
 /** Self-contained host plugin: intercepts llm/stream to translate model output.
- *  Supports Bing/Google free APIs (direct HTTP) and DeepSeek models (via LLM runtime). */
+ *  Supports Bing/Google free APIs (direct HTTP), DeepSeek models (via the LLM
+ *  runtime), and an offline CTranslate2 + Opus-MT engine that runs entirely on
+ *  this machine with no network round trip. */
 
 import { createHash } from 'node:crypto'
-import { appendFileSync, mkdirSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
+import path from 'node:path'
 
 const BING_ENDPOINT = 'https://edge.microsoft.com/translate/translatetext'
 const GOOGLE_ENDPOINT = 'https://translate.googleapis.com/translate_a/single'
 const DEFAULT_MODEL = 'deepseek-flash'
+
+/* ────────────────────────────────────────────────────────────────────────────
+ * Offline engine: CTranslate2 + Opus-MT
+ *
+ *  Everything in this section is only reachable when `provider` is 'opus'. The
+ *  engine is a native addon (one prebuilt .node per platform) that loads a
+ *  directory of five files — config.json / model.bin / shared_vocabulary.json /
+ *  source.spm / target.spm — and runs inference on this machine. There is no
+ *  network call, no API key, and no model inference on the user's credentials.
+ *
+ *  Models come from the publicly hosted Marian/Opus-MT conversion by gaudi,
+ *  which already ships in CTranslate2 layout, so there is nothing to convert:
+ *    https://huggingface.co/gaudi/opus-mt-en-zh-ctranslate2
+ *
+ *  A model is ~160 MB. Downloads are streamed to a `.part` file and renamed
+ *  into place only after a full write, so an interrupted download never looks
+ *  like a valid model and is retried from scratch rather than loaded truncated.
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+/** Default location for offline models, relative to the Harness home. */
+const DEFAULT_OFFLINE_DIR = 'model-translator/models'
+
+/** HuggingFace repo template for a per-pair converted Opus-MT model. */
+const HF_REPO = (pair) => `gaudi/opus-mt-${pair}-ctranslate2`
+
+/** Files that make a directory a loadable CTranslate2 model. */
+const MODEL_FILES = ['config.json', 'model.bin', 'shared_vocabulary.json', 'source.spm', 'target.spm']
+
+/** Marker for a model that is present but not trustworthy (e.g. a failed load). */
+const BROKEN_MARKER = '.load-error'
+
+/** Language pairs that are actually available as Opus-MT Marian conversions.
+ *  This is the practical support matrix — everything else fails fast with a
+ *  message that names the available pairs instead of a bare HTTP 404. */
+const SUPPORTED_PAIRS = new Set([
+  'en-zh', 'zh-en', 'en-ja', 'ja-en', 'en-ko', 'ko-en', 'en-fr', 'fr-en',
+  'en-de', 'de-en', 'en-es', 'es-en', 'en-ru', 'ru-en', 'en-pt', 'pt-en',
+  'en-nl', 'nl-en', 'zh-ja', 'ja-zh', 'en-it', 'it-en',
+])
+
+/** Maximum source characters per offline segment. Opus-MT Marian models have a
+ *  hard 512-token context limit; going over it makes CTranslate2 abort the whole
+ *  batch with "No position encodings are defined", which the caller reports as a
+ *  failed block. Measured on this machine, ~2900 English characters is already
+ *  too long, so 2000 is the safe ceiling. Longer blocks are split into more,
+ *  smaller segments rather than being rejected. */
+const OPUS_MAX_CHARS = 2000
+
+/** Per-block segment concurrency for the offline engine only. Offline inference
+ *  is synchronous CPU work, so concurrent segments do not overlap — they fight
+ *  for the same cores and finish no faster than serial execution. Serial keeps
+ *  the event loop predictably busy and makes the latency add up honestly. */
+const OPUS_SEGMENT_CONCURRENCY = 1
+
+/** Map a normalized language tag onto its family code, so a user's `zh-CN`
+ *  target resolves to the `zh` model. Unknown tags keep their own spelling. */
+function pairSide(tag) {
+  const lower = (tag || '').toLowerCase()
+  if (lower.startsWith('zh')) return 'zh'
+  if (lower.startsWith('ja')) return 'ja'
+  if (lower.startsWith('ko')) return 'ko'
+  if (lower.startsWith('fr')) return 'fr'
+  if (lower.startsWith('de')) return 'de'
+  if (lower.startsWith('es')) return 'es'
+  if (lower.startsWith('pt')) return 'pt'
+  if (lower.startsWith('ru')) return 'ru'
+  if (lower.startsWith('it')) return 'it'
+  if (lower.startsWith('nl')) return 'nl'
+  return lower.split('-')[0]
+}
+
+/** Resolve the 'auto' offline pair from the detected source language and the
+ *  configured target language, or validate a concrete pair. Returns
+ *  `{ pair, fallback }` where `fallback` is true when the pair was guessed
+ *  rather than configured — callers log it so a silent en→zh choice is
+ *  diagnosable instead of looking like a mystery model. */
+function resolveOfflinePair(detected, targetLanguage, configured) {
+  if (configured && configured !== 'auto') {
+    if (!SUPPORTED_PAIRS.has(configured)) {
+      throw new Error(
+        `offlinePair "${configured}" is not an available Opus-MT pair; available: ` +
+        [...SUPPORTED_PAIRS].join(', '))
+    }
+    return { pair: configured, fallback: false }
+  }
+  const src = pairSide(detected)
+  const tgt = pairSide(targetLanguage)
+  if (!src || !tgt) {
+    throw new Error(`cannot infer an offline pair from source "${detected}" and target "${targetLanguage}"`)
+  }
+  if (src === tgt) return { pair: null, fallback: false } // same language: caller skips
+  const pair = `${src}-${tgt}`
+  return { pair: SUPPORTED_PAIRS.has(pair) ? pair : null, fallback: true }
+}
+
+/** Root directory holding per-pair offline model directories. */
+function offlineRoot() {
+  const base = process.env.DSH_HOME || path.join(os.homedir() || os.tmpdir(), '.dsh')
+  return path.join(base, DEFAULT_OFFLINE_DIR)
+}
+
+/** Resolve a pair's model directory: the configured override first, else the
+ *  default under the Harness home. An empty override means "use the default". */
+function modelDirFor(pair, overrideDir) {
+  const root = overrideDir && overrideDir.trim() ? overrideDir.trim() : offlineRoot()
+  return path.join(root, `opus-mt-${pair}`)
+}
+
+/** Whether `dir` already holds a complete, trusted model. A partial download
+ *  is excluded because `model.bin` is written last — but a load failure also
+ *  leaves every file present, so a marker file records that and keeps us from
+ *  re-trying a broken model on every call. */
+function modelLooksComplete(dir) {
+  try {
+    if (!existsSync(path.join(dir, MODEL_FILES[MODEL_FILES.length - 1]))) return false
+    if (existsSync(path.join(dir, BROKEN_MARKER))) return false
+    return MODEL_FILES.every((f) => existsSync(path.join(dir, f)))
+  } catch {
+    return false
+  }
+}
+
+/** List the pairs already present locally, so the settings form can show the
+ *  user what is cached without re-reading the disk on every render. */
+export function listOfflineModels(overrideDir) {
+  const out = []
+  const dirs = [overrideDir && overrideDir.trim() ? overrideDir.trim() : '', offlineRoot()]
+  const seen = new Set()
+  for (const root of dirs) {
+    if (!root || seen.has(root)) continue
+    seen.add(root)
+    let entries
+    try { entries = readdirSync(root, { withFileTypes: true }) } catch { continue }
+    for (const e of entries) {
+      if (!e.isDirectory() || !e.name.startsWith('opus-mt-')) continue
+      const pair = e.name.slice('opus-mt-'.length)
+      if (modelLooksComplete(path.join(root, e.name))) out.push(pair)
+    }
+  }
+  return [...new Set(out)].sort()
+}
+
+/** Download one file, streaming to a `.part` sibling and renaming on success.
+ *  Returns false on any failure so the caller can retry or surface it. */
+async function downloadFile(url, dest) {
+  const part = `${dest}.part`
+  try {
+    const response = await fetch(url)
+    if (!response.ok || !response.body) return false
+    mkdirSync(path.dirname(dest), { recursive: true })
+    // No redirect option is passed deliberately: follow the CDN, but do not
+    // silently hand the text anywhere else. Credentials are omitted so no
+    // cookie or bearer token ever leaves the host process.
+    const bytes = Buffer.from(await response.arrayBuffer())
+    writeFileSync(part, bytes)
+    renameSync(part, dest)
+    return true
+  } catch {
+    try { if (existsSync(part)) writeFileSync(`${part}.failed`, '') } catch { /* best effort */ }
+    return false
+  }
+}
+
+/** Make sure a complete model for `pair` exists under `dir`, downloading it
+ *  from HuggingFace when `autoDownload` is on. Resolves to the directory path
+ *  on success, or throws with a message that names what was tried. */
+async function ensureModel(pair, config) {
+  const dir = modelDirFor(pair, config.offlineModelDir)
+  if (modelLooksComplete(dir)) return dir
+
+  if (!config.offlineAutoDownload) {
+    throw new Error(
+      `offline model for "${pair}" not found at ${dir} — place config.json, model.bin, ` +
+      `shared_vocabulary.json, source.spm and target.spm there, or enable offlineAutoDownload`)
+  }
+
+  logEvent('offline-download', { pair, dir })
+  mkdirSync(dir, { recursive: true })
+  const repo = HF_REPO(pair)
+  let missing = []
+  for (const f of MODEL_FILES) {
+    const dest = path.join(dir, f)
+    if (existsSync(dest) && statSync(dest).size > 0) continue
+    missing.push(f)
+    const ok = await downloadFile(
+      `https://huggingface.co/${repo}/resolve/main/${f}`, dest)
+    if (!ok) throw new Error(`failed to download ${repo}/${f}`)
+  }
+  if (!modelLooksComplete(dir)) {
+    throw new Error(`offline model for "${pair}" is incomplete at ${dir} (downloaded: ${missing.join(', ')})`)
+  }
+  logEvent('offline-downloaded', { pair, dir, files: missing.join(', ') })
+  return dir
+}
+
+/** LRU of loaded translators by model directory. Holding them open is the
+ *  whole point of the offline engine: the ~5 s model-load cost is paid once
+ *  and then every block is a few hundred milliseconds of pure inference. */
+const ct2Translators = new Map()
+
+/** Lazily load the native addon once. Fails once and stays failed, so an
+ *  unsupported platform does not pay an import cost on every block. */
+let ct2Loader = null
+async function loadCt2() {
+  if (ct2Loader === null) {
+    ct2Loader = import('ctranslate2').catch((e) => {
+      throw new Error(
+        `the offline engine is unavailable on this platform: ${e && e.message ? e.message : e}`)
+    })
+  }
+  return ct2Loader
+}
+
+/** Load (or reuse) the translator for a model directory. A translator that
+ *  fails to load is recorded on disk so later calls fail fast rather than
+ *  re-trying a bad model.bin every stream. */
+async function translatorFor(pair, config) {
+  const dir = await ensureModel(pair, config)
+  if (ct2Translators.has(dir)) return ct2Translators.get(dir)
+  const ct2 = await loadCt2()
+  const t = new ct2.Ct2Translator({
+    modelPath: dir,
+    device: 'cpu',
+    threads: config.offlineThreads,
+  })
+  ct2Translators.set(dir, t)
+  logEvent('offline-loaded', { pair, dir, threads: config.offlineThreads })
+  return t
+}
+
+/** Split text around the placeholder tokens emitted by extractCode / extractNouns
+ *  into pieces the model can translate on its own.
+ *
+ *  A neural model will happily translate a placeholder (`[[CODE0]]` becomes
+ *  `[[编号]]`), so the offline path cannot rely on a model obeying a "keep this
+ *  literal" instruction the way a chat model will. Instead the text is split at
+ *  every placeholder, only the text between them is sent for translation, and
+ *  the placeholders are reinserted verbatim by position. A placeholder the
+ *  model would have destroyed is never given to it. */
+function splitAroundPlaceholders(text) {
+  const parts = text.split(/(\[\[(?:CODE|NOUN)\d+\]\])/g).filter((p) => p !== undefined && p !== '')
+  return parts
+}
+
+/** Load (or reuse) the translator for a pair, returning it alongside the
+ *  directory it was loaded from. The directory rides along so failures can be
+ *  logged with exactly which files were read. */
+async function loadOffline(pair, config) {
+  const dir = await ensureModel(pair, config)
+  const translator = ct2Translators.has(dir) ? ct2Translators.get(dir) : await translatorFor(pair, config)
+  return { translator, dir }
+}
+
+/** Translate text with the offline engine.
+ *
+ *  Returns the translated text, or throws. The caller's existing fallback
+ *  (flush the original block verbatim) applies, so a broken offline engine can
+ *  never break a stream — but it also cannot silently degrade: every failure
+ *  is logged with the pair, the model directory, and the elapsed time. */
+export async function translateOffline(text, pair, config, signal) {
+  if (text === '') return ''
+  if (signal && signal.aborted) throw new Error('translation aborted')
+
+  const t0 = Date.now()
+  let translator
+  let dir = ''
+  try {
+    const loaded = await loadOffline(pair, config)
+    translator = loaded.translator
+    dir = loaded.dir
+  } catch (e) {
+    throw new Error(`offline engine unavailable for "${pair}": ${e && e.message ? e.message : e}`)
+  }
+
+  try {
+    const parts = splitAroundPlaceholders(text)
+    const index = []
+    const toSend = []
+    for (let i = 0; i < parts.length; i++) {
+      if (/^\[\[(?:CODE|NOUN)\d+\]\]$/.test(parts[i])) index.push({ placeholder: parts[i] })
+      else { index.push({ text: parts[i] }); toSend.push(parts[i]) }
+    }
+
+    if (toSend.length === 0) return parts.join('')
+    if (toSend.every((s) => s.trim() === '')) return parts.join('')
+
+    const results = await translator.translateBatch(toSend, { beamSize: config.offlineBeamSize })
+    if (!Array.isArray(results) || results.length !== toSend.length) {
+      throw new Error(`offline engine returned ${results?.length ?? 0} results for ${toSend.length} segments`)
+    }
+
+    const out = []
+    let ri = 0
+    for (const part of index) {
+      if (part.placeholder) out.push(part.placeholder)
+      else {
+        const r = results[ri++]
+        out.push(typeof r === 'object' && r !== null && typeof r.text === 'string' ? r.text : String(r ?? ''))
+      }
+    }
+
+    const translated = out.join('')
+    logEvent('offline-translated', {
+      pair, modelDir: dir, segments: toSend.length,
+      elapsedMs: Date.now() - t0,
+      textChars: text.length, outChars: translated.length,
+    })
+    return translated
+  } catch (e) {
+    logEvent('offline-fail', {
+      pair, modelDir: dir, elapsedMs: Date.now() - t0,
+      error: e && e.message ? e.message : String(e),
+    })
+    throw e
+  }
+}
+
 
 /** Schemastery config schema.
  *  The Harness settings system (SettingsForms.describe) only surfaces entries
@@ -30,12 +350,14 @@ import z from '@deepseek-ai/schemastery'
 
 
 export const Config = z.object({
-  // Four translation modes:
+  // Five translation modes:
   //  'auto'   — follow the current conversation's provider+model (no model pick)
   //  'model'  — translate with a specific dsh-loaded model chosen below; the
   //             provider is looked up from that model's catalog group
   //  'bing'/'google' — free HTTP translation engines (never call a model)
-  provider: z.union(['auto', 'model', 'bing', 'google']).default('auto').volatile(),
+  //  'opus'   — offline: CTranslate2 + Opus-MT Marian model on this machine.
+  //             No network call, no model inference on your credentials.
+  provider: z.union(['auto', 'model', 'bing', 'google', 'opus']).default('auto').volatile(),
   // Only meaningful for 'model': a concrete model id from dsh's loaded catalog.
   // 'auto' (or under the 'auto' provider) follows the current conversation's model.
   model: z.string().default('auto').volatile(),
@@ -54,6 +376,30 @@ export const Config = z.object({
   // length. Lower it for providers with small request limits; raise it to make
   // fewer, larger translation calls.
   maxTextChars: z.natural().min(2).default(4000).volatile(),
+  // ── Offline engine ('opus') only ────────────────────────────────────────
+  // Language pair used for the offline model, in "source-target" order. 'auto'
+  // infers the pair from the detected source language and targetLanguage; that
+  // is what every user actually wants, so it is the default. Opus-MT models are
+  // per-pair, so a concrete pair means that model is loaded — and the reverse
+  // direction is unavailable unless its own pair is configured too.
+  offlinePair: z.string().default('auto').volatile(),
+  // Directory holding the per-pair model directories (config.json / model.bin /
+  // shared_vocabulary.json / source.spm / target.spm). Empty = the plugin's
+  // own default under $DSH_HOME/model-translator/models.
+  offlineModelDir: z.string().default('').volatile(),
+  // CPU threads handed to the CTranslate2 backend. Measured on this host, 4
+  // threads is ~1.3x faster than 2 for a ~1800-char English segment, and the
+  // marginal gain flattens past that. Bounded because a runaway value would
+  // oversubscribe the machine on every translation call.
+  offlineThreads: z.natural().min(1).max(32).default(4).volatile(),
+  // Beam search width. 4 matches the CTranslate2 default and is the best
+  // quality/cost point for Marian; 1 is much faster but visibly worse.
+  offlineBeamSize: z.natural().min(1).max(12).default(4).volatile(),
+  // Whether to download the ~160 MB model automatically on first use. When off,
+  // the engine is only used if the model directory already exists locally, so a
+  // user who wants fully offline-from-first-run behaviour can keep it disabled
+  // and vendor the files themselves.
+  offlineAutoDownload: z.boolean().default(true).volatile(),
 })
 
 /** Resolve 'auto' to a concrete language code. Prefers the client-pushed
@@ -71,9 +417,17 @@ function resolveLanguage(lang, interfaceLanguage) {
   return tag
 }
 
-/** Normalize language tag for the given provider. */
+/** Normalize a language tag for the given provider.
+ *
+ *  Each backend speaks a different dialect of "Chinese": Google wants a
+ *  region-qualified tag (`zh-CN`/`zh-TW`), Bing wants a script tag
+ *  (`zh-Hans`/`zh-Hant`), and the offline Opus-MT model directories are keyed
+ *  by the two-letter family code only (`en-zh`, `zh-en`), so a `zh-CN` target
+ *  maps to the plain `zh` model. Anything outside the Chinese family is passed
+ *  through unchanged. */
 function normalizeLanguage(tag, provider) {
-  const lower = tag.toLowerCase()
+  const lower = (tag || '').toLowerCase()
+  if (provider === 'opus') return lower.startsWith('zh') ? 'zh' : lower
   if (['zh', 'zh-cn', 'zh-sg', 'zh-hans'].includes(lower)) {
     return provider === 'google' ? 'zh-CN' : 'zh-Hans'
   }
@@ -1132,8 +1486,14 @@ function pushGlossary(terms) {
  * time is roughly one segment round, not N. On ANY segment failure the whole
  * call throws so the caller falls back to the original block verbatim — a
  * block is never emitted half-translated (the documented guarantee).
- * @param translate - function translating one segment string to the target language. */
-async function translateLong(translate, text, chunkSize) {
+ *
+ * `chunkSize` and `concurrency` are both provider-specific: the offline engine
+ * has a hard 512-token context limit, so its segments must be smaller than
+ * maxTextChars, and it does synchronous CPU work, so its segments must not run
+ * in parallel.
+ * @param translate - function translating one segment string to the target language.
+ * @param concurrency - max segments in flight; defaults to SEGMENT_CONCURRENCY. */
+async function translateLong(translate, text, chunkSize, concurrency = SEGMENT_CONCURRENCY) {
   if (!text) return ''
   const segments = splitText(text, chunkSize)
   if (segments.length === 1) return translate(text)
@@ -1152,7 +1512,7 @@ async function translateLong(translate, text, chunkSize) {
       }
     }
   }
-  const workers = Array.from({ length: Math.min(SEGMENT_CONCURRENCY, segments.length) }, worker)
+  const workers = Array.from({ length: Math.min(concurrency, segments.length) }, worker)
   await Promise.all(workers)
   if (failed) throw new Error('translation segment failed')
   return results.join('')
@@ -1550,7 +1910,11 @@ async function* translateStream(original, config, signal, llm, currentModel) {
             break
           }
 
-          if (mode === 'bing' || mode === 'google') {
+          // The offline engine is a third "free engine": it never calls a model
+          // and never hits the network, so it shares the free-engine path and
+          // inherits the same glossary/timeout semantics.
+          const isOfflineMode = mode === 'opus'
+          if (mode === 'bing' || mode === 'google' || isOfflineMode) {
             provider = mode
             model = config.model
           } else if (mode === 'model') {
@@ -1588,7 +1952,10 @@ async function* translateStream(original, config, signal, llm, currentModel) {
 
           // Step 5: Cache check — skip the translation call entirely if this
           // exact (source, target, provider) triple was already translated.
-          const isFreeEngine = provider === 'bing' || provider === 'google'
+          // The offline engine supports no prompt context, so it is treated as a
+          // free engine here: the same glossary is withheld from it, and the
+          // same fallback-to-original-text guarantee applies.
+          const isFreeEngine = provider === 'bing' || provider === 'google' || provider === 'opus'
           const cacheKey = hashKey(strippedNouns, language, provider)
           const cached = cacheGet(cacheKey)
           if (cached !== undefined) {
@@ -1610,10 +1977,32 @@ async function* translateStream(original, config, signal, llm, currentModel) {
           // terminology. Free engines don't support context, so glossary is
           // only passed for model routes.
           const glossaryContext = isFreeEngine ? undefined : [...glossary]
-          const translateSegment = (seg, m) => isFreeEngine
-            ? translateText(provider, seg, language, config.timeoutMs, signal)
-            : translateWithLlm(llm, provider, m || DEFAULT_MODEL, seg, language, config.timeoutMs, signal, glossaryContext)
-          const runTranslate = (m) => translateLong((seg) => translateSegment(seg, m), strippedNouns, config.maxTextChars)
+          const translateSegment = (seg, m) => {
+            if (provider === 'opus') {
+              // The offline model is per language pair and directional — an
+              // `en-zh` model does not translate Chinese into English. The pair
+              // comes from the configured offlinePair, or is inferred from this
+              // block's detected language plus the target language. A block
+              // whose script identifies no language (pure Latin) defaults to
+              // English, which is by far the common case for text this plugin
+              // ever sees.
+              const source = detected || 'en'
+              const { pair } = resolveOfflinePair(source, language, config.offlinePair)
+              if (!pair) return Promise.resolve(seg) // same language: nothing to do
+              return translateOffline(seg, pair, config, signal)
+            }
+            return isFreeEngine
+              ? translateText(provider, seg, language, config.timeoutMs, signal)
+              : translateWithLlm(llm, provider, m || DEFAULT_MODEL, seg, language, config.timeoutMs, signal, glossaryContext)
+          }
+          // Offline segments are capped below maxTextChars (the model's 512-token
+          // context) and run serially (synchronous CPU), so their latency adds
+          // up honestly instead of overlapping.
+          const isOffline = provider === 'opus'
+          const segmentChunkSize = isOffline ? Math.min(config.maxTextChars, OPUS_MAX_CHARS) : config.maxTextChars
+          const segmentConcurrency = isOffline ? OPUS_SEGMENT_CONCURRENCY : SEGMENT_CONCURRENCY
+          const runTranslate = (m) =>
+            translateLong((seg) => translateSegment(seg, m), strippedNouns, segmentChunkSize, segmentConcurrency)
           let translated
           try {
             translated = await runTranslate(model)
@@ -1718,6 +2107,11 @@ function snapshot(config) {
     translateThinking: config.translateThinking.get(),
     timeoutMs: config.timeoutMs.get(),
     maxTextChars: config.maxTextChars.get(),
+    offlinePair: config.offlinePair.get(),
+    offlineModelDir: config.offlineModelDir.get(),
+    offlineThreads: config.offlineThreads.get(),
+    offlineBeamSize: config.offlineBeamSize.get(),
+    offlineAutoDownload: config.offlineAutoDownload.get(),
   }
 }
 
@@ -1750,6 +2144,11 @@ export function apply(ctx, config) {
     translateThinking: cfg0.translateThinking,
     timeoutMs: cfg0.timeoutMs,
     maxTextChars: cfg0.maxTextChars,
+    offlinePair: cfg0.offlinePair,
+    offlineThreads: cfg0.offlineThreads,
+    offlineBeamSize: cfg0.offlineBeamSize,
+    offlineAutoDownload: cfg0.offlineAutoDownload,
+    offlineModels: listOfflineModels(cfg0.offlineModelDir),
   })
 
   // Re-entrancy guard: skip ONLY the llm/stream call this plugin itself issues

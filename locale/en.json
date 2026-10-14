@@ -1,7 +1,7 @@
 {
   "meta": {
     "title": "Model Translator",
-    "description": "Auto-translate model output and thinking (reasoning) to any language. Supports Bing, Google, and model-based translation."
+    "description": "Auto-translate model output and thinking (reasoning) to any language. Supports Bing, Google, model-based translation, and an offline CTranslate2 + Opus-MT engine."
   },
   "settings": {
     "title": "Model Translator Settings",
@@ -28,6 +28,15 @@
     "providerModel": "Model translation engine (pick a model)",
     "providerBing": "Bing Translate (free)",
     "providerGoogle": "Google Translate (free)",
+    "providerOpus": "Offline (CTranslate2 + Opus-MT)",
+    "providerHintOpus": "Runs CTranslate2 + an Opus-MT model locally on this machine. No network call, no API key, text never leaves the host. Slower than a model route — roughly 100 chars/s on 4 CPU threads.",
+    "offline": "Offline engine",
+    "offlinePair": "Language pair",
+    "offlinePairHint": "The offline model is per language pair and directional. \"Auto\" picks it from the block's detected language; a concrete pair forces that direction only.",
+    "offlinePairAuto": "Auto (infer from the block)",
+    "offlineAutoDownload": "Download models automatically",
+    "offlineAutoDownloadHint": "Fetches the ~160 MB model per pair on first use, from the public gaudi ctranslate2 conversion on HuggingFace. When off, the engine is only used if the model is already on disk.",
+    "offlineNote": "Long blocks are split below 2000 chars because Opus-MT models have a 512-token context limit. Offline inference is synchronous CPU work, so concurrent segments are run serially.",
     "langAuto": "Auto (follow interface language)",
     "langZh": "Chinese (Simplified)",
     "langEn": "English",

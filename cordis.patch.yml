@@ -7,3 +7,9 @@
         targetLanguage: auto
         translateOutput: true
         translateThinking: true
+        # Offline engine (CTranslate2 + Opus-MT). Auto-download fetches the
+        # ~160 MB model per pair from the public gaudi ctranslate2 conversion
+        # on HuggingFace; 'offlinePair: auto' infers the pair from each block's
+        # detected language, which is what most users want.
+        offlinePair: auto
+        offlineAutoDownload: true

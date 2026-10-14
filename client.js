@@ -37,6 +37,19 @@ window.__ModuleLoader__.load({
       providerModel: 'Model translation engine (pick a model)',
       providerBing: 'Bing Translate (free)',
       providerGoogle: 'Google Translate (free)',
+      providerOpus: 'Offline (CTranslate2 + Opus-MT)',
+      providerHintFree: 'Free translation API \u2014 no model inference, text is sent to the translation service.',
+      providerHintOpus: 'Runs CTranslate2 + an Opus-MT model locally on this machine. No network call, no API key, text never leaves the host. Slower than a model route \u2014 roughly 100 chars/s on 4 CPU threads.',
+      offline: 'Offline engine',
+      offlinePair: 'Language pair',
+      offlinePairHint: 'The offline model is per language pair and directional. \u201cAuto\u201d picks it from the block\u2019s detected language; a concrete pair forces that direction only.',
+      offlinePairAuto: 'Auto (infer from the block)',
+      offlinePairCap: 'Forced pair',
+      offlineAutoDownload: 'Download models automatically',
+      offlineAutoDownloadHint: 'Fetches the ~160 MB model per pair on first use, from the public gaudi ctranslate2 conversion on HuggingFace. When off, the engine is only used if the model is already on disk.',
+      offlineCached: 'Pairs available locally',
+      offlineNone: 'none',
+      offlineNote: 'Long blocks are split below 2000 chars because Opus-MT models have a 512-token context limit. Offline inference is synchronous CPU work, so concurrent segments are run serially.',
       langAuto: 'Auto (follow interface language)',
       langZh: 'Chinese (Simplified)',
       langEn: 'English',
@@ -79,6 +92,19 @@ window.__ModuleLoader__.load({
       providerModel: '模型翻译引擎（选择模型）',
       providerBing: 'Bing 翻译（免费）',
       providerGoogle: 'Google 翻译（免费）',
+      providerOpus: '离线（CTranslate2 + Opus-MT）',
+      providerHintFree: '免费翻译 API —— 不调用模型，文本会发送到翻译服务。',
+      providerHintOpus: '在本机用 CTranslate2 + Opus-MT 模型运行。无网络请求、无 API key、文本不离开主机。比模型路由慢 —— 4 个 CPU 线程下约 100 字符/秒。',
+      offline: '离线引擎',
+      offlinePair: '语言对',
+      offlinePairHint: '离线模型是按语言对且单向的。「自动」按文本检测到的语言选择；指定具体语言对则只走该方向。',
+      offlinePairAuto: '自动（按文本推断）',
+      offlinePairCap: '固定语言对',
+      offlineAutoDownload: '自动下载模型',
+      offlineAutoDownloadHint: '首次使用时从 HuggingFace 的 gaudi ctranslate2 公开转换下载约 160 MB 的模型。关闭后，只有模型已在磁盘上时才会启用离线引擎。',
+      offlineCached: '本地已有语言对',
+      offlineNone: '无',
+      offlineNote: '长块会切分到 2000 字符以下，因为 Opus-MT 模型有 512 token 上下文上限。离线推理是同步 CPU 计算，因此分段串行执行。',
       langAuto: '自动（跟随界面语言）',
       langZh: '中文（简体）',
       langEn: '英语',
@@ -105,10 +131,25 @@ window.__ModuleLoader__.load({
         case 'model': return t('providerModel');
         case 'bing': return t('providerBing');
         case 'google': return t('providerGoogle');
+        case 'opus': return t('providerOpus');
         default: return value;
       }
     }
-    const PROVIDER_VALUES = ['auto', 'model', 'bing', 'google'];
+    const PROVIDER_VALUES = ['auto', 'model', 'bing', 'google', 'opus'];
+
+    /* Supported offline language pairs. Opus-MT models are per-pair and
+       directional, so this is what the dropdown offers when a user wants to
+       force a direction instead of letting the plugin infer it per block. */
+    const OFFLINE_PAIR_VALUES = [
+      'auto', 'en-zh', 'zh-en', 'en-ja', 'ja-en', 'en-ko', 'ko-en',
+      'en-fr', 'fr-en', 'en-de', 'de-en', 'en-es', 'es-en',
+      'en-ru', 'ru-en', 'en-pt', 'pt-en', 'en-nl', 'nl-en',
+      'zh-ja', 'ja-zh', 'en-it', 'it-en',
+    ];
+
+    function offlinePairLabel(t, value) {
+      return value === 'auto' ? t('offlinePairAuto') : value;
+    }
 
     function languageLabel(t, value) {
       switch (value) {
@@ -125,10 +166,11 @@ window.__ModuleLoader__.load({
     }
     const LANGUAGE_VALUES = ['auto', 'zh', 'en', 'ja', 'ko', 'fr', 'de', 'es'];
 
-    /* Free HTTP translation engines; every other provider value is a model
-       route that needs a model id (possibly 'auto' to follow the chat). */
+    /* Free HTTP translation engines plus the offline engine; every other
+       provider value is a model route that needs a model id (possibly 'auto'
+       to follow the chat). */
     function isFreeEngine(provider) {
-      return provider === 'bing' || provider === 'google';
+      return provider === 'bing' || provider === 'google' || provider === 'opus';
     }
 
     /* ── shared inline styles ── */
@@ -159,6 +201,9 @@ window.__ModuleLoader__.load({
       const [translateThinking, setTranslateThinking] = useState(value.translateThinking ?? true);
       const [timeoutMs,     setTimeoutMs]     = useState(value.timeoutMs     ?? 10000);
       const [maxTextChars,  setMaxTextChars]  = useState(value.maxTextChars  ?? 4000);
+      const [offlinePair,   setOfflinePair]   = useState(value.offlinePair   ?? 'auto');
+      const [offlineAutoDownload, setOfflineAutoDownload] = useState(value.offlineAutoDownload ?? true);
+      const [offlinePairs,  setOfflinePairs]  = useState([]);
 
       const [saving, setSaving] = useState(false);
       const [saved,  setSaved]  = useState(false);
@@ -172,7 +217,7 @@ window.__ModuleLoader__.load({
       useEffect(() => {
         const v = snapshot.value ?? {};
         const sig = [v.provider, v.model, v.targetLanguage, v.translateOutput, v.translateThinking,
-          v.timeoutMs, v.maxTextChars].join('\u0001');
+          v.timeoutMs, v.maxTextChars, v.offlinePair, v.offlineAutoDownload].join('\u0001');
         if (sig === lastSig.current) return;
         lastSig.current = sig;
         setProvider(v.provider ?? 'auto');
@@ -182,6 +227,8 @@ window.__ModuleLoader__.load({
         setTranslateThinking(v.translateThinking ?? true);
         setTimeoutMs(v.timeoutMs ?? 10000);
         setMaxTextChars(v.maxTextChars ?? 4000);
+        setOfflinePair(v.offlinePair ?? 'auto');
+        setOfflineAutoDownload(v.offlineAutoDownload ?? true);
         setError(null);
       }, [snapshot.value]);
 
@@ -217,6 +264,8 @@ window.__ModuleLoader__.load({
             { op: 'set', path: ['translateThinking'], value: translateThinking },
             { op: 'set', path: ['timeoutMs'],       value: timeout },
             { op: 'set', path: ['maxTextChars'],    value: maxChars },
+            { op: 'set', path: ['offlinePair'],     value: offlinePair },
+            { op: 'set', path: ['offlineAutoDownload'], value: offlineAutoDownload },
           ];
           if (isModelMode) ops.push({ op: 'set', path: ['model'], value: model });
 
@@ -232,6 +281,7 @@ window.__ModuleLoader__.load({
 
       const disabled    = snapshot.status !== 'ready' || !snapshot.writable || saving;
       const isModelMode = provider === 'model';
+      const isOfflineMode = provider === 'opus';
       const isFree      = isFreeEngine(provider);
 
       /* ── loading / unavailable guards ── */
@@ -274,7 +324,8 @@ window.__ModuleLoader__.load({
             PROVIDER_VALUES.map((v) => h('option', { key: v, value: v }, providerLabel(t, v))),
           ),
           h('p', { style: S.desc },
-            isFree ? t('providerHintFree')
+            provider === 'opus' ? t('providerHintOpus')
+              : isFree ? t('providerHintFree')
               : provider === 'model' ? t('providerHintModel')
               : t('providerHintAuto')),
         ),
@@ -296,6 +347,34 @@ window.__ModuleLoader__.load({
               ),
           modelsError ? h('p', { style: { ...S.desc, color: '#d32f2f' } }, t('modelLoadFailed')) : null,
           h('p', { style: S.desc }, t('modelHintModel')),
+        ) : null,
+
+        /* ── Offline engine (only in 'opus' mode) ── */
+        isOfflineMode ? h('div', { style: { display: 'flex', flexDirection: 'column', gap: '6px' } },
+          h('p', { style: { margin: 0, fontWeight: 600, fontSize: '12px', color: '#888' } }, t('offline')),
+          h('div', { style: { ...S.input, display: 'flex', alignItems: 'center', gap: '8px', color: '#555' } },
+            h('label', { style: S.check, margin: 0 },
+              h('input', {
+                type: 'checkbox',
+                checked: offlineAutoDownload,
+                onChange: (e) => { setOfflineAutoDownload(e.target.checked); setSaved(false); },
+                disabled,
+              }),
+              h('span', {}, t('offlineAutoDownload')),
+            ),
+          ),
+          h('p', { style: S.desc }, t('offlineAutoDownloadHint')),
+          h('label', { style: S.label }, t('offlinePair')),
+          h('select', {
+            value: offlinePair,
+            onChange: (e) => { setOfflinePair(e.target.value); setSaved(false); },
+            disabled,
+            style: S.input,
+          },
+            OFFLINE_PAIR_VALUES.map((v) => h('option', { key: v, value: v }, offlinePairLabel(t, v))),
+          ),
+          h('p', { style: S.desc }, t('offlinePairHint')),
+          h('p', { style: S.desc }, t('offlineNote')),
         ) : null,
 
         /* ── Target Language ── */
