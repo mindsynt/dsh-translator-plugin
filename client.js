@@ -39,14 +39,14 @@ window.__ModuleLoader__.load({
       providerGoogle: 'Google Translate (free)',
       providerOpus: 'Offline (CTranslate2 + Opus-MT)',
       providerHintFree: 'Free translation API \u2014 no model inference, text is sent to the translation service.',
-      providerHintOpus: 'Runs CTranslate2 + an Opus-MT model locally on this machine. No network call, no API key, text never leaves the host. Slower than a model route \u2014 roughly 100 chars/s on 4 CPU threads.',
+      providerHintOpus: 'Runs CTranslate2 + an Opus-MT model locally on this machine. No network call, no API key, text never leaves the host. The en\u2013zh model ships bundled; other pairs download on first use. Slower than a model route \u2014 roughly 100 chars/s on 4 CPU threads.',
       offline: 'Offline engine',
       offlinePair: 'Language pair',
       offlinePairHint: 'The offline model is per language pair and directional. \u201cAuto\u201d picks it from the block\u2019s detected language; a concrete pair forces that direction only.',
       offlinePairAuto: 'Auto (infer from the block)',
       offlinePairCap: 'Forced pair',
-      offlineAutoDownload: 'Download models automatically',
-      offlineAutoDownloadHint: 'Fetches the ~160 MB model per pair on first use, from the public gaudi ctranslate2 conversion on HuggingFace. When off, the engine is only used if the model is already on disk.',
+      offlineAutoDownload: 'Download other language pairs automatically',
+      offlineAutoDownloadHint: 'The en\u2013zh model ships bundled. When this is on, any other pair downloads ~160 MB from HuggingFace on first use; when off, only bundled or already-cached models work.',
       offlineCached: 'Pairs available locally',
       offlineNone: 'none',
       offlineNote: 'Long blocks are split below 2000 chars because Opus-MT models have a 512-token context limit. Offline inference is synchronous CPU work, so concurrent segments are run serially.',
@@ -94,14 +94,14 @@ window.__ModuleLoader__.load({
       providerGoogle: 'Google 翻译（免费）',
       providerOpus: '离线（CTranslate2 + Opus-MT）',
       providerHintFree: '免费翻译 API —— 不调用模型，文本会发送到翻译服务。',
-      providerHintOpus: '在本机用 CTranslate2 + Opus-MT 模型运行。无网络请求、无 API key、文本不离开主机。比模型路由慢 —— 4 个 CPU 线程下约 100 字符/秒。',
+      providerHintOpus: '在本机用 CTranslate2 + Opus-MT 模型运行。无网络请求、无 API key、文本不离开主机。en-zh 模型已随插件捆绑；其他语言对首次使用时下载。比模型路由慢 —— 4 个 CPU 线程下约 100 字符/秒。',
       offline: '离线引擎',
       offlinePair: '语言对',
       offlinePairHint: '离线模型是按语言对且单向的。「自动」按文本检测到的语言选择；指定具体语言对则只走该方向。',
       offlinePairAuto: '自动（按文本推断）',
       offlinePairCap: '固定语言对',
-      offlineAutoDownload: '自动下载模型',
-      offlineAutoDownloadHint: '首次使用时从 HuggingFace 的 gaudi ctranslate2 公开转换下载约 160 MB 的模型。关闭后，只有模型已在磁盘上时才会启用离线引擎。',
+      offlineAutoDownload: '自动下载其他语言对的模型',
+      offlineAutoDownloadHint: 'en-zh 模型已随插件捆绑。开启后，其他语言对首次使用时从 HuggingFace 下载约 160 MB；关闭后，仅捆绑的或已缓存的模型可用。',
       offlineCached: '本地已有语言对',
       offlineNone: '无',
       offlineNote: '长块会切分到 2000 字符以下，因为 Opus-MT 模型有 512 token 上下文上限。离线推理是同步 CPU 计算，因此分段串行执行。',
@@ -202,7 +202,7 @@ window.__ModuleLoader__.load({
       const [timeoutMs,     setTimeoutMs]     = useState(value.timeoutMs     ?? 10000);
       const [maxTextChars,  setMaxTextChars]  = useState(value.maxTextChars  ?? 4000);
       const [offlinePair,   setOfflinePair]   = useState(value.offlinePair   ?? 'auto');
-      const [offlineAutoDownload, setOfflineAutoDownload] = useState(value.offlineAutoDownload ?? true);
+      const [offlineAutoDownload, setOfflineAutoDownload] = useState(value.offlineAutoDownload ?? false);
       const [offlinePairs,  setOfflinePairs]  = useState([]);
 
       const [saving, setSaving] = useState(false);
@@ -228,7 +228,7 @@ window.__ModuleLoader__.load({
         setTimeoutMs(v.timeoutMs ?? 10000);
         setMaxTextChars(v.maxTextChars ?? 4000);
         setOfflinePair(v.offlinePair ?? 'auto');
-        setOfflineAutoDownload(v.offlineAutoDownload ?? true);
+        setOfflineAutoDownload(v.offlineAutoDownload ?? false);
         setError(null);
       }, [snapshot.value]);
 

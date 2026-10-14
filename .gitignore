@@ -1,6 +1,11 @@
 # Dependencies
 node_modules/
 
+# Model binaries assembled from split parts (model-part-aa, model-part-ab)
+# These are generated on first load; the parts are committed instead because
+# GitHub rejects files over 100 MB.
+models/**/model.bin
+
 # Package manager caches & install state
 .pnpm-store/
 package-lock.json

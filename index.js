@@ -5,8 +5,10 @@
 
 import { createHash } from 'node:crypto'
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs'
+import { createReadStream, createWriteStream } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 const BING_ENDPOINT = 'https://edge.microsoft.com/translate/translatetext'
 const GOOGLE_ENDPOINT = 'https://translate.googleapis.com/translate_a/single'
@@ -32,6 +34,11 @@ const DEFAULT_MODEL = 'deepseek-flash'
 
 /** Default location for offline models, relative to the Harness home. */
 const DEFAULT_OFFLINE_DIR = 'model-translator/models'
+
+/** Models bundled with the plugin itself, so a fresh install has at least the
+ *  default language pair without a network round trip. `__dirname` via
+ *  fileURLToPath: this is an ESM module, so no require.main. */
+const BUNDLED_MODEL_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), 'models')
 
 /** HuggingFace repo template for a per-pair converted Opus-MT model. */
 const HF_REPO = (pair) => `gaudi/opus-mt-${pair}-ctranslate2`
@@ -112,22 +119,34 @@ function offlineRoot() {
   return path.join(base, DEFAULT_OFFLINE_DIR)
 }
 
-/** Resolve a pair's model directory: the configured override first, else the
- *  default under the Harness home. An empty override means "use the default". */
+/** Resolve a pair's model directory. Search order:
+ *  1. The configured override (offlineModelDir), if set.
+ *  2. The models bundled with the plugin (so a fresh install works offline).
+ *  3. The Harness home default, where downloaded models are cached.
+ *  The first directory that holds a complete model wins. */
 function modelDirFor(pair, overrideDir) {
-  const root = overrideDir && overrideDir.trim() ? overrideDir.trim() : offlineRoot()
-  return path.join(root, `opus-mt-${pair}`)
+  const sub = `opus-mt-${pair}`
+  if (overrideDir && overrideDir.trim()) {
+    return path.join(overrideDir.trim(), sub)
+  }
+  const bundled = path.join(BUNDLED_MODEL_DIR, sub)
+  if (modelLooksComplete(bundled)) return bundled
+  return path.join(offlineRoot(), sub)
 }
 
 /** Whether `dir` already holds a complete, trusted model. A partial download
  *  is excluded because `model.bin` is written last — but a load failure also
  *  leaves every file present, so a marker file records that and keeps us from
- *  re-trying a broken model on every call. */
+ *  re-trying a broken model on every call. `model.bin` counts as present if
+ *  it exists directly OR if the split parts (model-part-*) are there and will
+ *  be concatenated on first use. */
 function modelLooksComplete(dir) {
   try {
-    if (!existsSync(path.join(dir, MODEL_FILES[MODEL_FILES.length - 1]))) return false
     if (existsSync(path.join(dir, BROKEN_MARKER))) return false
-    return MODEL_FILES.every((f) => existsSync(path.join(dir, f)))
+    const hasBin = existsSync(path.join(dir, 'model.bin')) ||
+      readdirSync(dir).some((f) => f.startsWith('model-part-'))
+    return MODEL_FILES.every((f) =>
+      f === 'model.bin' ? hasBin : existsSync(path.join(dir, f)))
   } catch {
     return false
   }
@@ -137,7 +156,7 @@ function modelLooksComplete(dir) {
  *  user what is cached without re-reading the disk on every render. */
 export function listOfflineModels(overrideDir) {
   const out = []
-  const dirs = [overrideDir && overrideDir.trim() ? overrideDir.trim() : '', offlineRoot()]
+  const dirs = [overrideDir && overrideDir.trim() ? overrideDir.trim() : '', BUNDLED_MODEL_DIR, offlineRoot()]
   const seen = new Set()
   for (const root of dirs) {
     if (!root || seen.has(root)) continue
@@ -183,8 +202,9 @@ async function ensureModel(pair, config) {
 
   if (!config.offlineAutoDownload) {
     throw new Error(
-      `offline model for "${pair}" not found at ${dir} — place config.json, model.bin, ` +
-      `shared_vocabulary.json, source.spm and target.spm there, or enable offlineAutoDownload`)
+      `offline model for "${pair}" not found — the plugin ships with en-zh bundled; ` +
+      `for "${pair}" either enable offlineAutoDownload, or place the five model files ` +
+      `in ${dir}`)
   }
 
   logEvent('offline-download', { pair, dir })
@@ -224,11 +244,45 @@ async function loadCt2() {
   return ct2Loader
 }
 
+/** Assemble model.bin from split parts (model-part-aa, model-part-ab, …).
+ *  GitHub rejects files over 100 MB, so the bundled model.bin is stored as
+ *  chunks that concatenate back into the original. Runs once on first load;
+ *  subsequent calls skip because model.bin already exists. */
+async function assembleModelBin(dir) {
+  const binPath = path.join(dir, 'model.bin')
+  if (existsSync(binPath)) return true
+  const parts = readdirSync(dir)
+    .filter((f) => f.startsWith('model-part-'))
+    .sort()
+  if (parts.length === 0) return false
+  return new Promise((resolve, reject) => {
+    const out = createWriteStream(binPath)
+    let failed = false
+    let finished = false
+    const fail = (e) => {
+      if (!failed && !finished) { failed = true; out.destroy(); reject(e) }
+    }
+    out.on('finish', () => { finished = true; resolve(true) })
+    out.on('error', fail)
+    let i = 0
+    const next = () => {
+      if (i >= parts.length) { out.end(); return }
+      const p = parts[i++]
+      const fin = createReadStream(path.join(dir, p))
+      fin.on('error', fail)
+      fin.on('end', next)
+      fin.pipe(out, { end: false })
+    }
+    next()
+  })
+}
+
 /** Load (or reuse) the translator for a model directory. A translator that
  *  fails to load is recorded on disk so later calls fail fast rather than
  *  re-trying a bad model.bin every stream. */
 async function translatorFor(pair, config) {
   const dir = await ensureModel(pair, config)
+  await assembleModelBin(dir)
   if (ct2Translators.has(dir)) return ct2Translators.get(dir)
   const ct2 = await loadCt2()
   const t = new ct2.Ct2Translator({
@@ -395,11 +449,11 @@ export const Config = z.object({
   // Beam search width. 4 matches the CTranslate2 default and is the best
   // quality/cost point for Marian; 1 is much faster but visibly worse.
   offlineBeamSize: z.natural().min(1).max(12).default(4).volatile(),
-  // Whether to download the ~160 MB model automatically on first use. When off,
-  // the engine is only used if the model directory already exists locally, so a
-  // user who wants fully offline-from-first-run behaviour can keep it disabled
-  // and vendor the files themselves.
-  offlineAutoDownload: z.boolean().default(true).volatile(),
+  // Whether to download an additional model automatically on first use, when
+  // the pair is not already bundled with the plugin or cached locally. Off by
+  // default so a fresh install stays fully offline; turn it on to fetch other
+  // language pairs from the public gaudi ctranslate2 conversion on HuggingFace.
+  offlineAutoDownload: z.boolean().default(false).volatile(),
 })
 
 /** Resolve 'auto' to a concrete language code. Prefers the client-pushed

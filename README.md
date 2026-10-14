@@ -36,12 +36,14 @@ There are five `provider` values — two free engines, two model modes, and one 
 | `model` | A dsh-loaded model you pick below. The provider is looked up from that model's catalog group. |
 | `bing` | The Microsoft Bing Translate free HTTP endpoint. No model inference. |
 | `google` | The Google Translate free HTTP endpoint. No model inference. |
-| `opus` | An **offline** CTranslate2 + Opus-MT model running on this machine. No network call, no API key, no credentials used. |
+| `opus` | An **offline** CTranslate2 + Opus-MT model running on this machine. No network call, no API key, no credentials used. The en-zh model ships bundled with the plugin; other pairs download on first use when `offlineAutoDownload` is on. |
 
 `auto` and `model` stay inside credentials you already loaded; `bing` and `google`
 are free but send the text to a third-party service; `opus` sends nothing anywhere
-but needs the model files. Pick the tradeoff you want — the `model` field is
-ignored entirely for the free and offline engines. Model routes translate with
+and includes the en-zh model in the package itself, so a fresh install translates
+offline with no download. Turn `offlineAutoDownload` on to fetch other language
+pairs from HuggingFace. The `model` field is ignored entirely for the free and
+offline engines. Model routes translate with
 `reasoningEffort: 'off'` and `maxTokens: 4096`, so an adapter that does not
 advertise an `off` effort will refuse the call (the original text is flushed).
 
@@ -64,7 +66,7 @@ exposes all of them, including the two advanced ones:
 | `offlineModelDir` | *(empty)* | Offline only. Override for `$DSH_HOME/model-translator/models` |
 | `offlineThreads` | `4` | Offline only. CPU threads for the CTranslate2 backend, 1–32 |
 | `offlineBeamSize` | `4` | Offline only. Beam search width, 1–12 |
-| `offlineAutoDownload` | `true` | Offline only. Fetch the ~160 MB model per pair on first use |
+| `offlineAutoDownload` | `false` | Offline only. When off, only bundled or already-cached models work; when on, other pairs download ~160 MB from HuggingFace on first use |
 | `interfaceLanguage` | `auto` | Not editable. Mirrors the UI locale so `targetLanguage: auto` resolves to what you actually read, not the host `LANG` |
 
 The form offers `auto`, `zh`, `en`, `ja`, `ko`, `fr`, `de`, `es`; the config
@@ -195,11 +197,12 @@ entirely.
 | `model` | 你自己在下方指定的 dsh 已加载模型。provider 按该模型在目录中的分组查找。 |
 | `bing` | 微软 Bing Translate 免费 HTTP 端点。不调用模型。 |
 | `google` | Google Translate 免费 HTTP 端点。不调用模型。 |
-| `opus` | **离线**：在本机运行的 CTranslate2 + Opus-MT 模型。无网络请求、无 API key、不使用任何凭据。 |
+| `opus` | **离线**：在本机运行的 CTranslate2 + Opus-MT 模型。无网络请求、无 API key、不使用任何凭据。en-zh 模型已随插件捆绑；其他语言对开启 `offlineAutoDownload` 后首次使用时下载。 |
 
 `auto` 与 `model` 都在你已加载的凭据之内；`bing` 与 `google` 免费，但会把文本
-发给第三方服务；`opus` 不往任何地方发送文本，但需要模型文件。按你的取舍选择 ——
-`model` 字段对免费与离线引擎完全不起作用。模型路由
+发给第三方服务；`opus` 不往任何地方发送文本，并且 en-zh 模型直接包含在插件包中，
+因此新安装即可离线翻译，无需下载。开启 `offlineAutoDownload` 可从 HuggingFace
+获取其他语言对。`model` 字段对免费与离线引擎完全不起作用。模型路由
 以 `reasoningEffort: 'off'`、`maxTokens: 4096` 发起翻译，因此不声明 `off` 级别的
 适配器会拒绝这次调用（此时会放出原文）。
 
@@ -221,7 +224,7 @@ entirely.
 | `offlineModelDir` | *(空)* | 仅离线。覆盖 `$DSH_HOME/model-translator/models` |
 | `offlineThreads` | `4` | 仅离线。CTranslate2 后端 CPU 线程数，1–32 |
 | `offlineBeamSize` | `4` | 仅离线。束搜索宽度，1–12 |
-| `offlineAutoDownload` | `true` | 仅离线。首次使用时抓取约 160 MB 的模型 |
+| `offlineAutoDownload` | `false` | 仅离线。关闭时仅使用捆绑或已缓存的模型；开启后其他语言对首次使用时从 HuggingFace 下载约 160 MB |
 | `interfaceLanguage` | `auto` | 不可编辑。镜像 UI 语言，让 `targetLanguage: auto` 解析成你实际阅读的语言，而不是 host `LANG` |
 
 表单提供 `auto`、`zh`、`en`、`ja`、`ko`、`fr`、`de`、`es`；配置本身接受任意语言
