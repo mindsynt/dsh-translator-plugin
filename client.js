@@ -58,6 +58,12 @@ window.__ModuleLoader__.load({
       offlineCached: 'Pairs available locally',
       offlineNone: 'none',
       offlineNote: 'Long blocks are split below 2000 chars because Opus-MT models have a 512-token context limit. Offline inference is synchronous CPU work, so concurrent segments are run serially.',
+      offlinePrefetch: 'Prefetch model',
+      offlinePrefetchHint: 'Download a model in advance. Select a model and click Download, then save settings and restart the plugin. Download status is logged.',
+      prefetchNone: '— Select model —',
+      prefetchDownload: 'Download',
+      prefetchDownloading: 'Starting...',
+      prefetchSelectModel: 'Please select a model to download.',
       langAuto: 'Auto (follow interface language)',
       langZh: 'Chinese (Simplified)',
       langEn: 'English',
@@ -121,6 +127,12 @@ window.__ModuleLoader__.load({
       offlineCached: '本地已有语言对',
       offlineNone: '无',
       offlineNote: '长块会切分到 2000 字符以下，因为 Opus-MT 模型有 512 token 上下文上限。离线推理是同步 CPU 计算，因此分段串行执行。',
+      offlinePrefetch: '预下载模型',
+      offlinePrefetchHint: '提前下载模型。选择模型后点击下载，保存设置并重启插件。下载状态会记录在日志中。',
+      prefetchNone: '— 选择模型 —',
+      prefetchDownload: '下载',
+      prefetchDownloading: '正在启动...',
+      prefetchSelectModel: '请选择要下载的模型。',
       langAuto: '自动（跟随界面语言）',
       langZh: '中文（简体）',
       langEn: '英语',
@@ -273,6 +285,8 @@ window.__ModuleLoader__.load({
       const [offlinePair,   setOfflinePair]   = useState(value.offlinePair   ?? 'auto');
       const [offlineAutoDownload, setOfflineAutoDownload] = useState(value.offlineAutoDownload ?? false);
       const [offlineModelSources, setOfflineModelSources] = useState(value.offlineModelSources ?? []);
+      const [offlinePrefetchModel, setOfflinePrefetchModel] = useState(value.offlinePrefetchModel ?? '');
+      const [prefetching, setPrefetching] = useState(false);
       const [offlinePairs,  setOfflinePairs]  = useState([]);
 
       const [saving, setSaving] = useState(false);
@@ -288,7 +302,7 @@ window.__ModuleLoader__.load({
         const v = snapshot.value ?? {};
         const sig = [v.provider, v.model, v.targetLanguage, v.translateOutput, v.translateThinking,
           v.translateMode, v.timeoutMs, v.maxTextChars, v.offlinePair, v.offlineAutoDownload,
-          v.offlineModelSources?.join(',')].join('\u0001');
+          v.offlineModelSources?.join(','), v.offlinePrefetchModel].join('\u0001');
         if (sig === lastSig.current) return;
         lastSig.current = sig;
         setProvider(v.provider ?? 'auto');
@@ -302,6 +316,7 @@ window.__ModuleLoader__.load({
         setOfflinePair(v.offlinePair ?? 'auto');
         setOfflineAutoDownload(v.offlineAutoDownload ?? false);
         setOfflineModelSources(v.offlineModelSources ?? []);
+        setOfflinePrefetchModel(v.offlinePrefetchModel ?? '');
         setError(null);
       }, [snapshot.value]);
 
@@ -341,6 +356,7 @@ window.__ModuleLoader__.load({
             { op: 'set', path: ['offlinePair'],     value: offlinePair },
             { op: 'set', path: ['offlineAutoDownload'], value: offlineAutoDownload },
             { op: 'set', path: ['offlineModelSources'], value: offlineModelSources },
+            { op: 'set', path: ['offlinePrefetchModel'], value: offlinePrefetchModel },
           ];
           if (isModelMode) ops.push({ op: 'set', path: ['model'], value: model });
 
@@ -475,6 +491,40 @@ window.__ModuleLoader__.load({
             OFFLINE_PAIR_VALUES.map((v) => h('option', { key: v, value: v }, offlinePairLabel(t, v))),
           ),
           h('p', { style: S.desc }, t('offlinePairHint')),
+          /* ── Prefetch model ── */
+          h('label', { style: S.label }, t('offlinePrefetch')),
+          h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center' } },
+            h('select', {
+              value: offlinePrefetchModel,
+              onChange: (e) => { setOfflinePrefetchModel(e.target.value); setSaved(false); },
+              disabled: prefetching || disabled,
+              style: { ...S.input, flex: 1 },
+            },
+              [h('option', { key: '', value: '' }, t('prefetchNone'))]
+                .concat(OFFLINE_PAIR_VALUES.filter(v => v !== 'auto').map(v => 
+                  h('option', { key: v, value: v }, offlinePairLabel(t, v))
+                )),
+            ),
+            h('button', {
+              type: 'button',
+              onClick: async () => {
+                if (!offlinePrefetchModel) { setError(t('prefetchSelectModel')); return; }
+                setPrefetching(true);
+                try {
+                  const ok = await form.mutate([{ op: 'set', path: ['offlinePrefetchModel'], value: offlinePrefetchModel }]);
+                  if (ok) setSaved(true);
+                  else setError(t('saveFailed'));
+                } catch (e) {
+                  setError(e.message || t('saveFailedGeneric'));
+                } finally {
+                  setPrefetching(false);
+                }
+              },
+              disabled: !offlinePrefetchModel || prefetching || disabled,
+              style: { ...S.btn, whiteSpace: 'nowrap' },
+            }, prefetching ? t('prefetchDownloading') : t('prefetchDownload')),
+          ),
+          h('p', { style: S.desc }, t('offlinePrefetchHint')),
           h('p', { style: S.desc }, t('offlineNote')),
         ) : null,
 

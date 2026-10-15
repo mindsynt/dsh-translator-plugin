@@ -564,6 +564,10 @@ export const Config = z.object({
   // openxlab.org.cn mirror the same gaudi/opus-mt repositories. Empty = use
   // built-in defaults.
   offlineModelSources: z.array(z.string()).default([]).volatile(),
+  // Model to prefetch on plugin start. Set this to download a model without
+  // waiting for first use. Empty = no prefetch. Cleared automatically after
+  // download completes or fails.
+  offlinePrefetchModel: z.string().default('').volatile(),
 })
 
 /** Resolve 'auto' to a concrete language code. Prefers the client-pushed
@@ -2633,6 +2637,24 @@ export function apply(ctx, config) {
     offlineAutoDownload: cfg0.offlineAutoDownload,
     offlineModels: listOfflineModels(cfg0.offlineModelDir),
   })
+
+  // Prefetch model if requested. The client sets offlinePrefetchModel to
+  // trigger a download; we run it here on startup and log the result.
+  if (cfg0.offlinePrefetchModel) {
+    const prefetchPair = cfg0.offlinePrefetchModel
+    logEvent('prefetch-start', { pair: prefetchPair })
+    ensureModel(prefetchPair, {
+      offlineModelDir: cfg0.offlineModelDir,
+      offlineAutoDownload: true,
+      offlineModelSources: cfg0.offlineModelSources,
+    }).then(() => {
+      logEvent('prefetch-complete', { pair: prefetchPair })
+      config.offlinePrefetchModel.set('') // Clear after success
+    }).catch((e) => {
+      logEvent('prefetch-failed', { pair: prefetchPair, error: e.message })
+      config.offlinePrefetchModel.set('') // Clear after failure too
+    })
+  }
 
   // Re-entrancy guard: skip ONLY the llm/stream call this plugin itself issues
   // (translateWithLlm -> prepared.stream -> llm/stream), detected via the
