@@ -983,6 +983,44 @@ function reportFailure(what, error, startedAt, facts) {
 }
 
 /**
+ * Detect garbled/invalid translation output from Opus-MT.
+ * Returns true if the translation should be rejected and original text used.
+ *
+ * Garbled patterns observed:
+ *  - Repeated characters: "aaaa...", "========", "⁇⁇⁇..."
+ *  - Word format codes: "\fn黑体\fs22..."
+ *  - Excessive special characters (>30% non-printable)
+ *  - Output much longer than source (>3x with no reason)
+ */
+function isGarbled(source, target) {
+  if (!target || target.length === 0) return true
+  if (source.length === 0) return false
+
+  // 1. Repeated single character runs (3+ same chars)
+  const repeatCount = (target.match(/(.)\1{2,}/g) || []).length
+  if (repeatCount > 0) return true
+
+  // 2. Word format codes (RTF-like)
+  if (/\\[a-z]{2,}[0-9a-fA-F]+/.test(target)) return true
+
+  // 3. Excessive special characters (>30% non-printable/non-CJK)
+  const specialCount = target.split('').filter(c => {
+    const code = c.charCodeAt(0)
+    return code < 32 || (code >= 0x80 && code < 0x2000) || c === '\u2047'
+  }).length
+  if (specialCount / target.length > 0.3) return true
+
+  // 4. Output too long (>3x source length, likely padding)
+  if (target.length > source.length * 3 && source.length > 10) return true
+
+  // 5. All punctuation/symbols (no actual content)
+  const contentChars = target.replace(/[^\p{L}\p{N}]/gu, '').length
+  if (contentChars === 0 && target.length > 3) return true
+
+  return false
+}
+
+/**
  * Localize English punctuation to Chinese equivalents in `text`.
  * Only converts punctuation that appears in prose context — URLs, email
  * addresses, file paths, and content inside Markdown code spans/blocks
@@ -1919,6 +1957,20 @@ async function translateSentence(text, config, signal, llm, currentModel, langua
     return text
   }
 
+  // Step 7.5: Garbled detection — Opus-MT sometimes outputs garbage like
+  // repeated chars ("aaaa..."), padding ("====..."), or RTF codes ("\fn...").
+  // Detect these and fall back to original text.
+  if (isGarbled(strippedNouns, translated)) {
+    logEvent('garbled-fallback', {
+      source: strippedNouns.slice(0, 100),
+      target: translated.slice(0, 100),
+      provider,
+      detected,
+      language,
+    })
+    return text
+  }
+
   // Step 8: Cache
   cacheSet(cacheKey, translated)
 
@@ -2334,6 +2386,20 @@ async function* translateStream(original, config, signal, llm, currentModel) {
             } else {
               throw e
             }
+          }
+
+          // Step 6.5: Garbled detection — Opus-MT sometimes outputs garbage.
+          // Check the full translation result and fall back to original.
+          if (isGarbled(strippedNouns, translated)) {
+            logEvent('garbled-fallback', {
+              what: `block ${chunk.index} (${blockType || 'unknown'})`,
+              source: strippedNouns.slice(0, 100),
+              target: translated.slice(0, 100),
+              provider, mode,
+            })
+            const finalText = reinsertNouns(reinsertCode(fullText, spans), nounSpans)
+            yield { ...chunk, block: { ...chunk.block, text: finalText } }
+            break
           }
 
           // Step 7: Reinsert code + noun placeholders, then apply the
