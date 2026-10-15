@@ -51,6 +51,8 @@ window.__ModuleLoader__.load({
       offlinePairCap: 'Forced pair',
       offlineAutoDownload: 'Download other language pairs automatically',
       offlineAutoDownloadHint: 'The en\u2013zh model ships bundled. When this is on, any other pair downloads ~160 MB from HuggingFace on first use; when off, only bundled or already-cached models work.',
+      offlineModelSources: 'Model download sources',
+      offlineModelSourcesHint: 'Tried in order when the first fails. Built-in: HuggingFace, hf-mirror, ModelScope, OpenXLab. Leave empty for defaults.',
       offlineCached: 'Pairs available locally',
       offlineNone: 'none',
       offlineNote: 'Long blocks are split below 2000 chars because Opus-MT models have a 512-token context limit. Offline inference is synchronous CPU work, so concurrent segments are run serially.',
@@ -110,6 +112,8 @@ window.__ModuleLoader__.load({
       offlinePairCap: '固定语言对',
       offlineAutoDownload: '自动下载其他语言对的模型',
       offlineAutoDownloadHint: 'en-zh 模型已随插件捆绑。开启后，其他语言对首次使用时从 HuggingFace 下载约 160 MB；关闭后，仅捆绑的或已缓存的模型可用。',
+      offlineModelSources: '模型下载源',
+      offlineModelSourcesHint: '下载失败时按顺序尝试这些源。内置：HuggingFace、hf-mirror、ModelScope、OpenXLab。留空使用默认。',
       offlineCached: '本地已有语言对',
       offlineNone: '无',
       offlineNote: '长块会切分到 2000 字符以下，因为 Opus-MT 模型有 512 token 上下文上限。离线推理是同步 CPU 计算，因此分段串行执行。',
@@ -221,6 +225,7 @@ window.__ModuleLoader__.load({
       const [maxTextChars,  setMaxTextChars]  = useState(value.maxTextChars  ?? 4000);
       const [offlinePair,   setOfflinePair]   = useState(value.offlinePair   ?? 'auto');
       const [offlineAutoDownload, setOfflineAutoDownload] = useState(value.offlineAutoDownload ?? false);
+      const [offlineModelSources, setOfflineModelSources] = useState(value.offlineModelSources ?? []);
       const [offlinePairs,  setOfflinePairs]  = useState([]);
 
       const [saving, setSaving] = useState(false);
@@ -235,7 +240,8 @@ window.__ModuleLoader__.load({
       useEffect(() => {
         const v = snapshot.value ?? {};
         const sig = [v.provider, v.model, v.targetLanguage, v.translateOutput, v.translateThinking,
-          v.translateMode, v.timeoutMs, v.maxTextChars, v.offlinePair, v.offlineAutoDownload].join('\u0001');
+          v.translateMode, v.timeoutMs, v.maxTextChars, v.offlinePair, v.offlineAutoDownload,
+          v.offlineModelSources?.join(',')].join('\u0001');
         if (sig === lastSig.current) return;
         lastSig.current = sig;
         setProvider(v.provider ?? 'auto');
@@ -248,6 +254,7 @@ window.__ModuleLoader__.load({
         setMaxTextChars(v.maxTextChars ?? 4000);
         setOfflinePair(v.offlinePair ?? 'auto');
         setOfflineAutoDownload(v.offlineAutoDownload ?? false);
+        setOfflineModelSources(v.offlineModelSources ?? []);
         setError(null);
       }, [snapshot.value]);
 
@@ -286,6 +293,7 @@ window.__ModuleLoader__.load({
             { op: 'set', path: ['maxTextChars'],    value: maxChars },
             { op: 'set', path: ['offlinePair'],     value: offlinePair },
             { op: 'set', path: ['offlineAutoDownload'], value: offlineAutoDownload },
+            { op: 'set', path: ['offlineModelSources'], value: offlineModelSources },
           ];
           if (isModelMode) ops.push({ op: 'set', path: ['model'], value: model });
 
@@ -384,6 +392,18 @@ window.__ModuleLoader__.load({
             ),
           ),
           h('p', { style: S.desc }, t('offlineAutoDownloadHint')),
+          h('label', { style: S.label }, t('offlineModelSources')),
+          h('textarea', {
+            value: offlineModelSources.join('\n'),
+            onChange: (e) => {
+              const sources = e.target.value.split('\n').map(s => s.trim()).filter(s => s.length > 0);
+              setOfflineModelSources(sources); setSaved(false);
+            },
+            disabled,
+            style: { ...S.input, minHeight: '60px', resize: 'vertical', fontFamily: 'monospace' },
+            placeholder: 'https://huggingface.co\nhttps://hf-mirror.com',
+          }),
+          h('p', { style: S.desc }, t('offlineModelSourcesHint')),
           h('label', { style: S.label }, t('offlinePair')),
           h('select', {
             value: offlinePair,

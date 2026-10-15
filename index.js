@@ -27,6 +27,11 @@ const DEFAULT_MODEL = 'deepseek-flash'
  *  which already ships in CTranslate2 layout, so there is nothing to convert:
  *    https://huggingface.co/gaudi/opus-mt-en-zh-ctranslate2
  *
+ *  Alternative mirrors are supported for regions where HuggingFace is blocked:
+ *    https://hf-mirror.com/gaudi/opus-mt-en-zh-ctranslate2
+ *    https://modelscope.cn/models/gaudi/opus-mt-en-zh-ctranslate2
+ *    https://openxlab.org.cn/models/gaudi/opus-mt-en-zh-ctranslate2
+ *
  *  A model is ~160 MB. Downloads are streamed to a `.part` file and renamed
  *  into place only after a full write, so an interrupted download never looks
  *  like a valid model and is retried from scratch rather than loaded truncated.
@@ -34,6 +39,15 @@ const DEFAULT_MODEL = 'deepseek-flash'
 
 /** Default location for offline models, relative to the Harness home. */
 const DEFAULT_OFFLINE_DIR = 'model-translator/models'
+
+/** Default model download sources, tried in order when the first fails.
+ *  These are mirrors of the same gaudi/opus-mt-* repositories. */
+const DEFAULT_MODEL_SOURCES = [
+  'https://huggingface.co',
+  'https://hf-mirror.com',
+  'https://modelscope.cn/models',
+  'https://openxlab.org.cn/models',
+]
 
 /** Models bundled with the plugin itself, so a fresh install has at least the
  *  default language pair without a network round trip. `__dirname` via
@@ -194,8 +208,9 @@ async function downloadFile(url, dest) {
 }
 
 /** Make sure a complete model for `pair` exists under `dir`, downloading it
- *  from HuggingFace when `autoDownload` is on. Resolves to the directory path
- *  on success, or throws with a message that names what was tried. */
+ *  from the configured model sources when `autoDownload` is on. Resolves to
+ *  the directory path on success, or throws with a message that names what
+ *  was tried. Tries each source in order until one succeeds. */
 async function ensureModel(pair, config) {
   const dir = modelDirFor(pair, config.offlineModelDir)
   if (modelLooksComplete(dir)) return dir
@@ -207,23 +222,53 @@ async function ensureModel(pair, config) {
       `in ${dir}`)
   }
 
-  logEvent('offline-download', { pair, dir })
-  mkdirSync(dir, { recursive: true })
+  const sources = config.offlineModelSources?.length > 0
+    ? config.offlineModelSources
+    : DEFAULT_MODEL_SOURCES
   const repo = HF_REPO(pair)
-  let missing = []
-  for (const f of MODEL_FILES) {
+  const missing = MODEL_FILES.filter(f => {
     const dest = path.join(dir, f)
-    if (existsSync(dest) && statSync(dest).size > 0) continue
-    missing.push(f)
-    const ok = await downloadFile(
-      `https://huggingface.co/${repo}/resolve/main/${f}`, dest)
-    if (!ok) throw new Error(`failed to download ${repo}/${f}`)
+    return !(existsSync(dest) && statSync(dest).size > 0)
+  })
+
+  if (missing.length === 0) {
+    logEvent('offline-download', { pair, dir, source: 'cached', files: [] })
+    return dir
   }
-  if (!modelLooksComplete(dir)) {
-    throw new Error(`offline model for "${pair}" is incomplete at ${dir} (downloaded: ${missing.join(', ')})`)
+
+  logEvent('offline-download', { pair, dir, source: sources[0], files: missing.join(', ') })
+  mkdirSync(dir, { recursive: true })
+
+  let lastError = null
+  for (const source of sources) {
+    let allOk = true
+    for (const f of missing) {
+      const dest = path.join(dir, f)
+      // Build URL based on source type
+      let url
+      if (source.includes('huggingface.co') || source.includes('hf-mirror.com')) {
+        url = `${source}/${repo}/resolve/main/${f}`
+      } else if (source.includes('modelscope.cn')) {
+        url = `${source}/${repo}/resolve/master/${f}`
+      } else if (source.includes('openxlab.org.cn')) {
+        url = `${source}/${repo}/resolve/master/${f}`
+      } else {
+        url = `${source}/${repo}/resolve/main/${f}`
+      }
+      const ok = await downloadFile(url, dest)
+      if (!ok) {
+        allOk = false
+        break
+      }
+    }
+    if (allOk) {
+      logEvent('offline-downloaded', { pair, dir, source, files: missing.join(', ') })
+      return dir
+    }
+    lastError = `source ${source}`
   }
-  logEvent('offline-downloaded', { pair, dir, files: missing.join(', ') })
-  return dir
+  throw new Error(
+    `failed to download model for "${pair}" from all sources: ${sources.join(', ')}`)
 }
 
 /** LRU of loaded translators by model directory. Holding them open is the
@@ -463,6 +508,11 @@ export const Config = z.object({
   // default so a fresh install stays fully offline; turn it on to fetch other
   // language pairs from the public gaudi ctranslate2 conversion on HuggingFace.
   offlineAutoDownload: z.boolean().default(false).volatile(),
+  // Model download sources, tried in order when the first fails. Useful for
+  // regions where HuggingFace is blocked — hf-mirror.com, modelscope.cn, and
+  // openxlab.org.cn mirror the same gaudi/opus-mt repositories. Empty = use
+  // built-in defaults.
+  offlineModelSources: z.array(z.string()).default([]).volatile(),
 })
 
 /** Resolve 'auto' to a concrete language code. Prefers the client-pushed
