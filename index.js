@@ -1789,11 +1789,23 @@ function isAbbreviation(text, periodIdx) {
 
 /** Find the end index of the first complete sentence in `text`.
  *  Returns the index just after the sentence-ending punctuation, or -1 if
- *  no sentence boundary is found. Ignores abbreviations and sentence
- *  ends inside code blocks (tracked via inCodeBlock state). */
+ *  no sentence boundary is found. Ignores abbreviations, decimal/version
+ *  periods, and sentence ends inside code blocks. Code fence state is
+ *  tracked within the text so periods inside ```...``` or ~~~...~~~ blocks
+ *  (e.g. Python comments "# step 1.", docstrings) are never treated as
+ *  sentence boundaries. */
 function findSentenceEnd(text, inCodeBlock) {
   if (inCodeBlock) return -1
+  let insideCodeBlock = false
   for (let i = 0; i < text.length; i++) {
+    // Track code fence state within the text.
+    if (text.startsWith('```', i) || text.startsWith('~~~', i)) {
+      insideCodeBlock = !insideCodeBlock
+      i += 2 // skip to end of fence marker
+      continue
+    }
+    if (insideCodeBlock) continue
+
     const ch = text[i]
     if (!SENTENCE_END_CHARS.has(ch)) continue
     // Don't treat an abbreviation period as a sentence end.
