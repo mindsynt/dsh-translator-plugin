@@ -1891,9 +1891,14 @@ async function translateSentence(text, config, signal, llm, currentModel, langua
       // target but the text still has substantial Latin-script prose,
       // force en→target so English words inside CJK sentences are
       // actually translated instead of passed through unchanged.
+      // Only match words surrounded by spaces/punctuation, not identifiers
+      // like snake_case (ask_user_question) or leading-underscore (_question).
       if (source === languageFamily(language)) {
         const nonPlaceholder = strippedNouns.replace(/\[\[⟪\*?\d+⟫\]\]/g, '')
-        if (/[a-zA-Z]{2,}/.test(nonPlaceholder)) source = 'en'
+        // Match English words: 2+ letters, preceded by space/punctuation/start,
+        // followed by space/punctuation/end. This excludes snake_case identifiers.
+        const hasEnglish = /(?:^|[\s\.,;:!?])[a-zA-Z]{2,}(?=[\s\.,;:!?]|$)/.test(nonPlaceholder)
+        if (hasEnglish) source = 'en'
       }
       const { pair } = resolveOfflinePair(source, language, config.offlinePair)
       if (!pair) return Promise.resolve(seg)
@@ -2230,8 +2235,11 @@ async function* translateStream(original, config, signal, llm, currentModel) {
             // Mixed-language guard: if the block has substantial English
             // content, don't skip — force the source to 'en' so the
             // translation pipeline processes it.
+            // Only match words surrounded by spaces/punctuation, not identifiers
+            // like snake_case (ask_user_question) or leading-underscore (_question).
             const nonPlaceholder = strippedNouns.replace(/\[\[⟪\*?\d+⟫\]\]/g, '')
-            if (/[a-zA-Z]{2,}/.test(nonPlaceholder)) {
+            const hasEnglish = /(?:^|[\s\.,;:!?])[a-zA-Z]{2,}(?=[\s\.,;:!?]|$)/.test(nonPlaceholder)
+            if (hasEnglish) {
               detected = 'en'
             } else {
               // No English content — already target language, skip.
