@@ -57,20 +57,29 @@ const BUNDLED_MODEL_DIR = path.join(path.dirname(fileURLToPath(import.meta.url))
 /** HuggingFace repo template for a per-pair converted Opus-MT model. */
 const HF_REPO = (pair) => `gaudi/opus-mt-${pair}-ctranslate2`
 
-/** Files that make a directory a loadable CTranslate2 model. */
-const MODEL_FILES = ['config.json', 'model.bin', 'shared_vocabulary.json', 'source.spm', 'target.spm']
+/** Files that make a directory a loadable CTranslate2 model.
+ *  Opus-MT uses source.spm + target.spm; NLLB uses sentencepiece.bpe.model. */
+const MODEL_FILES_OPUS = ['config.json', 'model.bin', 'shared_vocabulary.json', 'source.spm', 'target.spm']
+const MODEL_FILES_NLLB = ['config.json', 'model.bin', 'shared_vocabulary.json', 'sentencepiece.bpe.model']
+const MODEL_FILES = [...MODEL_FILES_OPUS, 'sentencepiece.bpe.model'] // union for existence checks
 
 /** Marker for a model that is present but not trustworthy (e.g. a failed load). */
 const BROKEN_MARKER = '.load-error'
 
-/** Language pairs that are actually available as Opus-MT Marian conversions.
- *  This is the practical support matrix — everything else fails fast with a
- *  message that names the available pairs instead of a bare HTTP 404. */
+/** Language pairs that are available as Opus-MT Marian conversions. */
 const SUPPORTED_PAIRS = new Set([
   'en-zh', 'zh-en', 'en-ja', 'ja-en', 'en-ko', 'ko-en', 'en-fr', 'fr-en',
   'en-de', 'de-en', 'en-es', 'es-en', 'en-ru', 'ru-en', 'en-pt', 'pt-en',
   'en-nl', 'nl-en', 'zh-ja', 'ja-zh', 'en-it', 'it-en',
 ])
+
+/** NLLB model repos on HuggingFace. NLLB supports 200 languages natively. */
+const NLLB_REPOS = {
+  '600m': 'entai2965/nllb-200-distilled-600M-ctranslate2',
+  'int8': 'Serkan007/CTranslate2-nllb-200-int8',
+  '1.3b': 'entai2965/nllb-200-distilled-1.3B-ctranslate2',
+  '3.3b': 'entai2965/nllb-200-3.3B-ctranslate2',
+}
 
 /** Maximum source characters per offline segment. Opus-MT Marian models have a
  *  hard 512-token context limit; going over it makes CTranslate2 abort the whole
@@ -110,10 +119,19 @@ function pairSide(tag) {
  *  diagnosable instead of looking like a mystery model. */
 function resolveOfflinePair(detected, targetLanguage, configured) {
   if (configured && configured !== 'auto') {
+    // Check for NLLB model variants
+    if (configured.startsWith('nllb-')) {
+      const variant = configured.replace('nllb-', '')
+      if (NLLB_REPOS[variant]) {
+        return { pair: configured, fallback: false }
+      }
+    }
+    // Check for Opus-MT pairs
     if (!SUPPORTED_PAIRS.has(configured)) {
       throw new Error(
-        `offlinePair "${configured}" is not an available Opus-MT pair; available: ` +
-        [...SUPPORTED_PAIRS].join(', '))
+        `offlinePair "${configured}" is not available; Opus-MT pairs: ` +
+        `[...SUPPORTED_PAIRS].join(', '); NLLB models: ` +
+        Object.keys(NLLB_REPOS).map(k => `nllb-${k}`).join(', '))
     }
     return { pair: configured, fallback: false }
   }
@@ -139,7 +157,14 @@ function offlineRoot() {
  *  3. The Harness home default, where downloaded models are cached.
  *  The first directory that holds a complete model wins. */
 function modelDirFor(pair, overrideDir) {
-  const sub = `opus-mt-${pair}`
+  // NLLB models use their own directory naming convention
+  let sub
+  if (pair.startsWith('nllb-')) {
+    const variant = pair.replace('nllb-', '')
+    sub = `nllb-${variant}`
+  } else {
+    sub = `opus-mt-${pair}`
+  }
   if (overrideDir && overrideDir.trim()) {
     return path.join(overrideDir.trim(), sub)
   }
@@ -159,8 +184,16 @@ function modelLooksComplete(dir) {
     if (existsSync(path.join(dir, BROKEN_MARKER))) return false
     const hasBin = existsSync(path.join(dir, 'model.bin')) ||
       readdirSync(dir).some((f) => f.startsWith('model-part-'))
-    return MODEL_FILES.every((f) =>
-      f === 'model.bin' ? hasBin : existsSync(path.join(dir, f)))
+    if (!hasBin) return false
+    // Check for Opus-MT format (source.spm + target.spm)
+    const hasOpusSpans = existsSync(path.join(dir, 'source.spm')) &&
+      existsSync(path.join(dir, 'target.spm'))
+    // Check for NLLB format (sentencepiece.bpe.model)
+    const hasNllbTokenizer = existsSync(path.join(dir, 'sentencepiece.bpe.model'))
+    // Common required files
+    const hasCommon = existsSync(path.join(dir, 'config.json')) &&
+      existsSync(path.join(dir, 'shared_vocabulary.json'))
+    return hasCommon && (hasOpusSpans || hasNllbTokenizer)
   } catch {
     return false
   }
@@ -218,15 +251,31 @@ async function ensureModel(pair, config) {
   if (!config.offlineAutoDownload) {
     throw new Error(
       `offline model for "${pair}" not found — the plugin ships with en-zh bundled; ` +
-      `for "${pair}" either enable offlineAutoDownload, or place the five model files ` +
+      `for "${pair}" either enable offlineAutoDownload, or place the model files ` +
       `in ${dir}`)
   }
 
   const sources = config.offlineModelSources?.length > 0
     ? config.offlineModelSources
     : DEFAULT_MODEL_SOURCES
-  const repo = HF_REPO(pair)
-  const missing = MODEL_FILES.filter(f => {
+
+  // Determine model type and files to download
+  let repo, requiredFiles
+  if (pair.startsWith('nllb-')) {
+    // NLLB model
+    const variant = pair.replace('nllb-', '')
+    repo = NLLB_REPOS[variant]
+    if (!repo) {
+      throw new Error(`unknown NLLB variant "${variant}"; available: ${Object.keys(NLLB_REPOS).join(', ')}`)
+    }
+    requiredFiles = MODEL_FILES_NLLB
+  } else {
+    // Opus-MT model
+    repo = HF_REPO(pair)
+    requiredFiles = MODEL_FILES_OPUS
+  }
+
+  const missing = requiredFiles.filter(f => {
     const dest = path.join(dir, f)
     return !(existsSync(dest) && statSync(dest).size > 0)
   })
@@ -490,6 +539,8 @@ export const Config = z.object({
   // is what every user actually wants, so it is the default. Opus-MT models are
   // per-pair, so a concrete pair means that model is loaded — and the reverse
   // direction is unavailable unless its own pair is configured too.
+  // NLLB models support 200 languages natively: use 'nllb-600m', 'nllb-int8',
+  // 'nllb-1.3b', or 'nllb-3.3b' for automatic language detection.
   offlinePair: z.string().default('auto').volatile(),
   // Directory holding the per-pair model directories (config.json / model.bin /
   // shared_vocabulary.json / source.spm / target.spm). Empty = the plugin's

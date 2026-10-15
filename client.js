@@ -46,11 +46,11 @@ window.__ModuleLoader__.load({
       providerHintOpus: 'Runs CTranslate2 + an Opus-MT model locally on this machine. No network call, no API key, text never leaves the host. The en\u2013zh model ships bundled; other pairs download on first use. Slower than a model route \u2014 roughly 100 chars/s on 4 CPU threads.',
       offline: 'Offline engine',
       offlinePair: 'Language pair',
-      offlinePairHint: 'The offline model is per language pair and directional. \u201cAuto\u201d picks it from the block\u2019s detected language; a concrete pair forces that direction only.',
+      offlinePairHint: 'Opus-MT models are per pair and directional. "Auto" infers from text. NLLB models support 200 languages with auto-detection.',
       offlinePairAuto: 'Auto (infer from the block)',
       offlinePairCap: 'Forced pair',
       offlineAutoDownload: 'Download other language pairs automatically',
-      offlineAutoDownloadHint: 'The en\u2013zh model ships bundled. When this is on, any other pair downloads ~160 MB from HuggingFace on first use; when off, only bundled or already-cached models work.',
+      offlineAutoDownloadHint: 'The en\u2013zh model ships bundled. When this is on, other pairs download from HuggingFace on first use (~160MB Opus-MT, ~600MB NLLB).',
       offlineModelSources: 'Model download sources',
       offlineModelSourcesHint: 'Tried in order when the first fails. Select a preset or custom.',
       sourceDefault: 'Default (try all in order)',
@@ -109,11 +109,11 @@ window.__ModuleLoader__.load({
       providerHintOpus: '在本机用 CTranslate2 + Opus-MT 模型运行。无网络请求、无 API key、文本不离开主机。en-zh 模型已随插件捆绑；其他语言对首次使用时下载。比模型路由慢 —— 4 个 CPU 线程下约 100 字符/秒。',
       offline: '离线引擎',
       offlinePair: '语言对',
-      offlinePairHint: '离线模型是按语言对且单向的。「自动」按文本检测到的语言选择；指定具体语言对则只走该方向。',
+      offlinePairHint: 'Opus-MT 模型是按语言对且单向的。「自动」按文本检测到的语言选择。NLLB 模型支持 200 种语言，自动检测。',
       offlinePairAuto: '自动（按文本推断）',
       offlinePairCap: '固定语言对',
       offlineAutoDownload: '自动下载其他语言对的模型',
-      offlineAutoDownloadHint: 'en-zh 模型已随插件捆绑。开启后，其他语言对首次使用时从 HuggingFace 下载约 160 MB；关闭后，仅捆绑的或已缓存的模型可用。',
+      offlineAutoDownloadHint: 'en-zh 模型已随插件捆绑。开启后，其他语言对首次使用时从 HuggingFace 下载（Opus-MT 约 160MB，NLLB 约 600MB）；关闭后，仅捆绑的或已缓存的模型可用。',
       offlineModelSources: '模型下载源',
       offlineModelSourcesHint: '下载失败时按顺序尝试这些源。选择预设源或自定义。',
       sourceDefault: '默认（按顺序尝试所有源）',
@@ -164,13 +164,33 @@ window.__ModuleLoader__.load({
 
     /* Supported offline language pairs. Opus-MT models are per-pair and
        directional, so this is what the dropdown offers when a user wants to
-       force a direction instead of letting the plugin infer it per block. */
+       force a direction instead of letting the plugin infer it per block.
+       NLLB models support 200 languages natively. */
     const OFFLINE_PAIR_VALUES = [
-      'auto', 'en-zh', 'zh-en', 'en-ja', 'ja-en', 'en-ko', 'ko-en',
+      'auto',
+      // NLLB models (200 languages, auto language detection)
+      'nllb-600m', 'nllb-int8', 'nllb-1.3b', 'nllb-3.3b',
+      // Opus-MT models (per-pair)
+      'en-zh', 'zh-en', 'en-ja', 'ja-en', 'en-ko', 'ko-en',
       'en-fr', 'fr-en', 'en-de', 'de-en', 'en-es', 'es-en',
       'en-ru', 'ru-en', 'en-pt', 'pt-en', 'en-nl', 'nl-en',
       'zh-ja', 'ja-zh', 'en-it', 'it-en',
     ];
+
+    function offlinePairLabel(t, value) {
+      if (value === 'auto') return t('offlinePairAuto');
+      if (value.startsWith('nllb-')) {
+        const variant = value.replace('nllb-', '');
+        const labels = {
+          '600m': 'NLLB-200 Distilled 600M (200种语言)',
+          'int8': 'NLLB-200 INT8 (200种语言)',
+          '1.3b': 'NLLB-200 Distilled 1.3B (200种语言)',
+          '3.3b': 'NLLB-200 3.3B (200种语言)',
+        };
+        return labels[variant] || value;
+      }
+      return value;
+    }
 
     /* Model download sources. Preset mirrors for regions where HuggingFace
        is blocked. Users can also select "custom" to enter their own URLs. */
