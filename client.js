@@ -52,7 +52,9 @@ window.__ModuleLoader__.load({
       offlineAutoDownload: 'Download other language pairs automatically',
       offlineAutoDownloadHint: 'The en\u2013zh model ships bundled. When this is on, any other pair downloads ~160 MB from HuggingFace on first use; when off, only bundled or already-cached models work.',
       offlineModelSources: 'Model download sources',
-      offlineModelSourcesHint: 'Tried in order when the first fails. Built-in: HuggingFace, hf-mirror, ModelScope, OpenXLab. Leave empty for defaults.',
+      offlineModelSourcesHint: 'Tried in order when the first fails. Select a preset or custom.',
+      sourceDefault: 'Default (try all in order)',
+      sourceCustom: 'Custom',
       offlineCached: 'Pairs available locally',
       offlineNone: 'none',
       offlineNote: 'Long blocks are split below 2000 chars because Opus-MT models have a 512-token context limit. Offline inference is synchronous CPU work, so concurrent segments are run serially.',
@@ -113,7 +115,9 @@ window.__ModuleLoader__.load({
       offlineAutoDownload: '自动下载其他语言对的模型',
       offlineAutoDownloadHint: 'en-zh 模型已随插件捆绑。开启后，其他语言对首次使用时从 HuggingFace 下载约 160 MB；关闭后，仅捆绑的或已缓存的模型可用。',
       offlineModelSources: '模型下载源',
-      offlineModelSourcesHint: '下载失败时按顺序尝试这些源。内置：HuggingFace、hf-mirror、ModelScope、OpenXLab。留空使用默认。',
+      offlineModelSourcesHint: '下载失败时按顺序尝试这些源。选择预设源或自定义。',
+      sourceDefault: '默认（按顺序尝试所有源）',
+      sourceCustom: '自定义',
       offlineCached: '本地已有语言对',
       offlineNone: '无',
       offlineNote: '长块会切分到 2000 字符以下，因为 Opus-MT 模型有 512 token 上下文上限。离线推理是同步 CPU 计算，因此分段串行执行。',
@@ -167,6 +171,29 @@ window.__ModuleLoader__.load({
       'en-ru', 'ru-en', 'en-pt', 'pt-en', 'en-nl', 'nl-en',
       'zh-ja', 'ja-zh', 'en-it', 'it-en',
     ];
+
+    /* Model download sources. Preset mirrors for regions where HuggingFace
+       is blocked. Users can also select "custom" to enter their own URLs. */
+    const MODEL_SOURCE_PRESETS = [
+      'default',           // Use built-in defaults (HF → hf-mirror → ModelScope → OpenXLab)
+      'huggingface',       // HuggingFace only
+      'hf-mirror',         // hf-mirror.com only (for China)
+      'modelscope',        // ModelScope only
+      'openxlab',          // OpenXLab only
+      'custom',            // Custom sources
+    ];
+
+    function modelSourceLabel(t, value) {
+      switch (value) {
+        case 'default': return t('sourceDefault');
+        case 'huggingface': return 'HuggingFace';
+        case 'hf-mirror': return 'hf-mirror (中国镜像)';
+        case 'modelscope': return 'ModelScope (魔搭)';
+        case 'openxlab': return 'OpenXLab';
+        case 'custom': return t('sourceCustom');
+        default: return value;
+      }
+    }
 
     function offlinePairLabel(t, value) {
       return value === 'auto' ? t('offlinePairAuto') : value;
@@ -393,16 +420,30 @@ window.__ModuleLoader__.load({
           ),
           h('p', { style: S.desc }, t('offlineAutoDownloadHint')),
           h('label', { style: S.label }, t('offlineModelSources')),
-          h('textarea', {
-            value: offlineModelSources.join('\n'),
+          h('select', {
+            value: offlineModelSources.length === 0 ? 'default' : (offlineModelSources.length === 1 && offlineModelSources[0] !== 'custom' ? offlineModelSources[0] : 'custom'),
             onChange: (e) => {
-              const sources = e.target.value.split('\n').map(s => s.trim()).filter(s => s.length > 0);
-              setOfflineModelSources(sources); setSaved(false);
+              const val = e.target.value;
+              let sources = [];
+              if (val === 'default') {
+                sources = [];
+              } else if (val === 'huggingface') {
+                sources = ['https://huggingface.co'];
+              } else if (val === 'hf-mirror') {
+                sources = ['https://hf-mirror.com'];
+              } else if (val === 'modelscope') {
+                sources = ['https://modelscope.cn/models'];
+              } else if (val === 'openxlab') {
+                sources = ['https://openxlab.org.cn/models'];
+              }
+              setOfflineModelSources(sources);
+              setSaved(false);
             },
             disabled,
-            style: { ...S.input, minHeight: '60px', resize: 'vertical', fontFamily: 'monospace' },
-            placeholder: 'https://huggingface.co\nhttps://hf-mirror.com',
-          }),
+            style: S.input,
+          },
+            MODEL_SOURCE_PRESETS.map((v) => h('option', { key: v, value: v }, modelSourceLabel(t, v))),
+          ),
           h('p', { style: S.desc }, t('offlineModelSourcesHint')),
           h('label', { style: S.label }, t('offlinePair')),
           h('select', {
