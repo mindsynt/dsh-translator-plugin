@@ -22,3 +22,13 @@ Thumbs.db
 *.swp
 .idea/
 .vscode/
+
+# CTranslate2 native addon (modified for NLLB support)
+!node_modules/ctranslate2/
+!node_modules/ctranslate2/**
+
+# Rust build artifacts (do not commit)
+node_modules/ctranslate2/target/
+node_modules/ctranslate2/*.node
+!node_modules/ctranslate2/index.linux-x64-gnu.node
+!node_modules/ctranslate2/ct2.*.node

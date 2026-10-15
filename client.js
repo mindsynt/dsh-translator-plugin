@@ -57,6 +57,8 @@ window.__ModuleLoader__.load({
       sourceCustom: 'Custom',
       offlineCached: 'Pairs available locally',
       offlineNone: 'none',
+      offlineModelDir: 'Model download location',
+      offlineModelDirHint: 'Downloaded models are saved to this directory. Default: ~/.dsh/model-translator/models/. You can set offlineModelDir to change it.',
       offlineNote: 'Long blocks are split below 2000 chars because Opus-MT models have a 512-token context limit. Offline inference is synchronous CPU work, so concurrent segments are run serially.',
       offlinePrefetch: 'Prefetch model',
       offlinePrefetchHint: 'Download a model in advance. Select a model and click Download, then save settings and restart the plugin. Download status is logged.',
@@ -64,6 +66,11 @@ window.__ModuleLoader__.load({
       prefetchDownload: 'Download',
       prefetchDownloading: 'Starting...',
       prefetchSelectModel: 'Please select a model to download.',
+      progressDownloading: 'Downloading model…',
+      progressFile: 'File',
+      progressOf: 'of',
+      progressComplete: 'Download complete ✓',
+      progressFailed: 'Download failed',
       langAuto: 'Auto (follow interface language)',
       langZh: 'Chinese (Simplified)',
       langEn: 'English',
@@ -126,6 +133,8 @@ window.__ModuleLoader__.load({
       sourceCustom: '自定义',
       offlineCached: '本地已有语言对',
       offlineNone: '无',
+      offlineModelDir: '模型下载位置',
+      offlineModelDirHint: '下载的模型保存在此目录。默认：~/.dsh/model-translator/models/。可通过 offlineModelDir 配置修改。',
       offlineNote: '长块会切分到 2000 字符以下，因为 Opus-MT 模型有 512 token 上下文上限。离线推理是同步 CPU 计算，因此分段串行执行。',
       offlinePrefetch: '预下载模型',
       offlinePrefetchHint: '提前下载模型。选择模型后点击下载，保存设置并重启插件。下载状态会记录在日志中。',
@@ -133,6 +142,11 @@ window.__ModuleLoader__.load({
       prefetchDownload: '下载',
       prefetchDownloading: '正在启动...',
       prefetchSelectModel: '请选择要下载的模型。',
+      progressDownloading: '正在下载模型…',
+      progressFile: '文件',
+      progressOf: '/',
+      progressComplete: '下载完成 ✓',
+      progressFailed: '下载失败',
       langAuto: '自动（跟随界面语言）',
       langZh: '中文（简体）',
       langEn: '英语',
@@ -285,8 +299,10 @@ window.__ModuleLoader__.load({
       const [offlinePair,   setOfflinePair]   = useState(value.offlinePair   ?? 'auto');
       const [offlineAutoDownload, setOfflineAutoDownload] = useState(value.offlineAutoDownload ?? false);
       const [offlineModelSources, setOfflineModelSources] = useState(value.offlineModelSources ?? []);
+      const [offlineModelDir, setOfflineModelDir] = useState(value.offlineModelDir ?? '');
       const [offlinePrefetchModel, setOfflinePrefetchModel] = useState(value.offlinePrefetchModel ?? '');
       const [prefetching, setPrefetching] = useState(false);
+      const [downloadProgress, setDownloadProgress] = useState(null);
       const [offlinePairs,  setOfflinePairs]  = useState([]);
 
       const [saving, setSaving] = useState(false);
@@ -302,7 +318,7 @@ window.__ModuleLoader__.load({
         const v = snapshot.value ?? {};
         const sig = [v.provider, v.model, v.targetLanguage, v.translateOutput, v.translateThinking,
           v.translateMode, v.timeoutMs, v.maxTextChars, v.offlinePair, v.offlineAutoDownload,
-          v.offlineModelSources?.join(','), v.offlinePrefetchModel].join('\u0001');
+          v.offlineModelSources?.join(','), v.offlineModelDir, v.offlinePrefetchModel].join('\u0001');
         if (sig === lastSig.current) return;
         lastSig.current = sig;
         setProvider(v.provider ?? 'auto');
@@ -316,8 +332,23 @@ window.__ModuleLoader__.load({
         setOfflinePair(v.offlinePair ?? 'auto');
         setOfflineAutoDownload(v.offlineAutoDownload ?? false);
         setOfflineModelSources(v.offlineModelSources ?? []);
+        setOfflineModelDir(v.offlineModelDir ?? '');
         setOfflinePrefetchModel(v.offlinePrefetchModel ?? '');
         setError(null);
+      }, [snapshot.value]);
+
+      /* track download progress — this is a volatile field updated by the
+         host during ensureModel(); it's not part of the editable signature */
+      useEffect(() => {
+        const v = snapshot.value ?? {};
+        const raw = v.downloadProgress;
+        if (!raw || raw === '') { setDownloadProgress(null); return; }
+        try {
+          const p = JSON.parse(raw);
+          setDownloadProgress(p);
+        } catch {
+          setDownloadProgress(null);
+        }
       }, [snapshot.value]);
 
       /* auto-clear the "Saved!" toast */
@@ -356,6 +387,7 @@ window.__ModuleLoader__.load({
             { op: 'set', path: ['offlinePair'],     value: offlinePair },
             { op: 'set', path: ['offlineAutoDownload'], value: offlineAutoDownload },
             { op: 'set', path: ['offlineModelSources'], value: offlineModelSources },
+            { op: 'set', path: ['offlineModelDir'], value: offlineModelDir },
             { op: 'set', path: ['offlinePrefetchModel'], value: offlinePrefetchModel },
           ];
           if (isModelMode) ops.push({ op: 'set', path: ['model'], value: model });
@@ -457,7 +489,17 @@ window.__ModuleLoader__.load({
           h('p', { style: S.desc }, t('offlineAutoDownloadHint')),
           h('label', { style: S.label }, t('offlineModelSources')),
           h('select', {
-            value: offlineModelSources.length === 0 ? 'default' : (offlineModelSources.length === 1 && offlineModelSources[0] !== 'custom' ? offlineModelSources[0] : 'custom'),
+            value: (() => {
+              if (offlineModelSources.length === 0) return 'default';
+              if (offlineModelSources.length === 1 && offlineModelSources[0] === 'custom') return 'custom';
+              const urlToPreset = {
+                'https://huggingface.co': 'huggingface',
+                'https://hf-mirror.com': 'hf-mirror',
+                'https://modelscope.cn/models': 'modelscope',
+                'https://openxlab.org.cn/models': 'openxlab',
+              };
+              return urlToPreset[offlineModelSources[0]] || 'custom';
+            })(),
             onChange: (e) => {
               const val = e.target.value;
               let sources = [];
@@ -481,6 +523,17 @@ window.__ModuleLoader__.load({
             MODEL_SOURCE_PRESETS.map((v) => h('option', { key: v, value: v }, modelSourceLabel(t, v))),
           ),
           h('p', { style: S.desc }, t('offlineModelSourcesHint')),
+          /* ── Model directory ── */
+          h('label', { style: S.label }, t('offlineModelDir')),
+          h('input', {
+            type: 'text',
+            value: offlineModelDir,
+            onChange: (e) => { setOfflineModelDir(e.target.value); setSaved(false); },
+            disabled,
+            placeholder: '~/.dsh/model-translator/models/',
+            style: { ...S.input, fontFamily: 'monospace', fontSize: '12px' },
+          }),
+          h('p', { style: S.desc }, t('offlineModelDirHint')),
           h('label', { style: S.label }, t('offlinePair')),
           h('select', {
             value: offlinePair,
@@ -522,8 +575,41 @@ window.__ModuleLoader__.load({
               },
               disabled: !offlinePrefetchModel || prefetching || disabled,
               style: { ...S.btn, whiteSpace: 'nowrap' },
-            }, prefetching ? t('prefetchDownloading') : t('prefetchDownload')),
+          }, prefetching ? t('prefetchDownloading') : t('prefetchDownload')),
           ),
+          /* download progress display */
+          downloadProgress ? h('div', {
+            style: {
+              marginTop: '8px',
+              padding: '8px 12px',
+              borderRadius: '6px',
+              backgroundColor: downloadProgress.status === 'complete' ? '#e8f5e9' :
+                downloadProgress.status === 'failed' ? '#ffebee' : '#e3f2fd',
+              border: '1px solid ' + (
+                downloadProgress.status === 'complete' ? '#4caf50' :
+                downloadProgress.status === 'failed' ? '#f44336' : '#2196f3'
+              ),
+              fontSize: '12px',
+              lineHeight: '1.5',
+            },
+          },
+            downloadProgress.status === 'downloading' ? [
+              h('div', { key: 'title', style: { fontWeight: 'bold', marginBottom: '4px' } },
+                t('progressDownloading') + ' ' + (downloadProgress.pair || '')),
+              h('div', { key: 'file', style: { color: '#555' } },
+                t('progressFile') + ' ' + downloadProgress.fileIndex + t('progressOf') +
+                ' ' + downloadProgress.totalFiles + ': ' + (downloadProgress.file || '')),
+              downloadProgress.source ? h('div', { key: 'src', style: { color: '#888', fontSize: '11px' } },
+                'from ' + downloadProgress.source) : null,
+            ] : downloadProgress.status === 'complete' ? [
+              h('div', { key: 'done', style: { fontWeight: 'bold', color: '#2e7d32' } },
+                t('progressComplete') + ' ' + (downloadProgress.pair || '')),
+              downloadProgress.dir ? h('div', { key: 'dir', style: { color: '#555', fontFamily: 'monospace', fontSize: '11px', marginTop: '4px' } },
+                downloadProgress.dir) : null,
+            ] : downloadProgress.status === 'failed' ? h('div', {
+              key: 'fail', style: { fontWeight: 'bold', color: '#c62828' },
+            }, t('progressFailed') + ' ' + (downloadProgress.pair || '') + ': ' + (downloadProgress.error || '')) : null
+          ) : null,
           h('p', { style: S.desc }, t('offlinePrefetchHint')),
           h('p', { style: S.desc }, t('offlineNote')),
         ) : null,
@@ -710,7 +796,23 @@ window.__ModuleLoader__.load({
           }
 
           const [snapshot, setSnapshot] = useState(form.getSnapshot());
-          useEffect(() => form.subscribe(() => setSnapshot(form.getSnapshot())), []);
+          useEffect(() => {
+            const unsub = form.subscribe(() => setSnapshot(form.getSnapshot()));
+            // Volatile field updates (downloadProgress) don't trigger form.subscribe,
+            // so poll every second to catch them.
+            let lastProgress = '';
+            const poll = () => {
+              const snap = form.getSnapshot();
+              const progress = snap.value?.downloadProgress || '';
+              if (progress !== lastProgress) {
+                lastProgress = progress;
+                setSnapshot(snap);
+              }
+            };
+            const interval = setInterval(poll, 1000);
+            poll();
+            return () => { unsub(); clearInterval(interval); };
+          }, []);
 
           const [, forceModels] = useState(0);
           useEffect(() => {

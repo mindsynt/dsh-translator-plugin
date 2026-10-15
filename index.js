@@ -58,10 +58,12 @@ const BUNDLED_MODEL_DIR = path.join(path.dirname(fileURLToPath(import.meta.url))
 const HF_REPO = (pair) => `gaudi/opus-mt-${pair}-ctranslate2`
 
 /** Files that make a directory a loadable CTranslate2 model.
- *  Opus-MT uses source.spm + target.spm; NLLB uses sentencepiece.bpe.model. */
+ *  Opus-MT uses source.spm + target.spm; NLLB uses sentencepiece.bpe.model.
+ *  Large models are split into model-part-* chunks (GitHub 100MB limit);
+ *  model.bin is assembled from parts on first load via assembleModelBin(). */
 const MODEL_FILES_OPUS = ['config.json', 'model.bin', 'shared_vocabulary.json', 'source.spm', 'target.spm']
-const MODEL_FILES_NLLB = ['config.json', 'model.bin', 'shared_vocabulary.json', 'sentencepiece.bpe.model']
-const MODEL_FILES = [...MODEL_FILES_OPUS, 'sentencepiece.bpe.model'] // union for existence checks
+const MODEL_FILES_NLLB = ['config.json', 'model.bin', 'shared_vocabulary.json', 'sentencepiece.bpe.model', 'special_tokens_map.json', 'tokenizer_config.json', 'tokenizer.json']
+const MODEL_FILES = [...MODEL_FILES_OPUS, 'sentencepiece.bpe.model', 'special_tokens_map.json', 'tokenizer_config.json', 'tokenizer.json'] // union for existence checks
 
 /** Marker for a model that is present but not trustworthy (e.g. a failed load). */
 const BROKEN_MARKER = '.load-error'
@@ -110,6 +112,23 @@ function pairSide(tag) {
   if (lower.startsWith('it')) return 'it'
   if (lower.startsWith('nl')) return 'nl'
   return lower.split('-')[0]
+}
+
+/** Map a language tag to its NLLB language code (e.g. 'zh' → 'zho_Hans').
+ *  NLLB models need a target prefix language code as the first token of
+ *  the decoder output. Without it the model produces garbage. */
+function nllbLangCode(tag) {
+  const code = pairSide(tag)
+  // Use Hans (simplified) for zh by default; switch to Hant if the tag says so
+  if (code === 'zh') {
+    return /hant|hk|tw/i.test(tag) ? 'zho_Hant' : 'zho_Hans'
+  }
+  const MAP = {
+    en: 'eng_Latn', fr: 'fra_Latn', de: 'deu_Latn', es: 'spa_Latn',
+    pt: 'por_Latn', it: 'ita_Latn', ru: 'rus_Cyrl', nl: 'nld_Latn',
+    ja: 'jpn_Jpan', ko: 'kor_Hang',
+  }
+  return MAP[code] || 'eng_Latn'
 }
 
 /** Resolve the 'auto' offline pair from the detected source language and the
@@ -219,9 +238,29 @@ export function listOfflineModels(overrideDir) {
   return [...new Set(out)].sort()
 }
 
+/** Get download progress for a model pair. Returns null if no download in progress. */
+export function getDownloadProgress(pair, overrideDir) {
+  const dir = modelDirFor(pair, overrideDir)
+  const progressFile = path.join(dir, '.download-progress')
+  try {
+    if (!existsSync(progressFile)) return null
+    const data = JSON.parse(readFileSync(progressFile, 'utf-8'))
+    // Check if progress is stale (older than 5 minutes)
+    if (Date.now() - data.time > 5 * 60 * 1000) {
+      // Clean up stale progress file
+      try { unlinkSync(progressFile) } catch { /* best effort */ }
+      return null
+    }
+    return data
+  } catch {
+    return null
+  }
+}
+
 /** Download one file, streaming to a `.part` sibling and renaming on success.
- *  Returns false on any failure so the caller can retry or surface it. */
-async function downloadFile(url, dest) {
+ *  Returns false on any failure so the caller can retry or surface it.
+ *  Writes download progress to a progress file if progressFile is provided. */
+async function downloadFile(url, dest, progressFile, currentFile, totalFiles) {
   const part = `${dest}.part`
   try {
     const response = await fetch(url)
@@ -233,6 +272,20 @@ async function downloadFile(url, dest) {
     const bytes = Buffer.from(await response.arrayBuffer())
     writeFileSync(part, bytes)
     renameSync(part, dest)
+    // Write progress update after file completes
+    if (progressFile) {
+      try {
+        const progress = {
+          status: 'downloading',
+          file: currentFile,
+          fileIndex: (Array.isArray(totalFiles) ? totalFiles.indexOf(currentFile) + 1 : 1),
+          totalFiles: Array.isArray(totalFiles) ? totalFiles.length : 1,
+          bytes: bytes.length,
+          time: Date.now(),
+        }
+        writeFileSync(progressFile, JSON.stringify(progress))
+      } catch { /* best effort */ }
+    }
     return true
   } catch {
     try { if (existsSync(part)) writeFileSync(`${part}.failed`, '') } catch { /* best effort */ }
@@ -243,7 +296,8 @@ async function downloadFile(url, dest) {
 /** Make sure a complete model for `pair` exists under `dir`, downloading it
  *  from the configured model sources when `autoDownload` is on. Resolves to
  *  the directory path on success, or throws with a message that names what
- *  was tried. Tries each source in order until one succeeds. */
+ *  was tried. Tries each source in order until one succeeds.
+ *  Updates downloadProgress in config if provided. */
 async function ensureModel(pair, config) {
   const dir = modelDirFor(pair, config.offlineModelDir)
   if (modelLooksComplete(dir)) return dir
@@ -288,10 +342,39 @@ async function ensureModel(pair, config) {
   logEvent('offline-download', { pair, dir, source: sources[0], files: missing.join(', ') })
   mkdirSync(dir, { recursive: true })
 
+  // Update progress via config if available
+  const updateProgress = (data) => {
+    if (config.downloadProgress && config.downloadProgress.set) {
+      try { config.downloadProgress.set(JSON.stringify(data)) } catch { /* best effort */ }
+    }
+  }
+
+  // Create progress file for tracking download progress
+  const progressFile = path.join(dir, '.download-progress')
+  updateProgress({
+    status: 'downloading',
+    pair,
+    totalFiles: missing.length,
+    files: missing,
+    currentFile: null,
+    time: Date.now(),
+  })
+  try {
+    writeFileSync(progressFile, JSON.stringify({
+      status: 'downloading',
+      pair,
+      totalFiles: missing.length,
+      files: missing,
+      currentFile: null,
+      time: Date.now(),
+    }))
+  } catch { /* best effort */ }
+
   let lastError = null
   for (const source of sources) {
     let allOk = true
-    for (const f of missing) {
+    for (let i = 0; i < missing.length; i++) {
+      const f = missing[i]
       const dest = path.join(dir, f)
       // Build URL based on source type
       let url
@@ -304,18 +387,52 @@ async function ensureModel(pair, config) {
       } else {
         url = `${source}/${repo}/resolve/main/${f}`
       }
-      const ok = await downloadFile(url, dest)
+      // Update progress before download
+      const progress = {
+        status: 'downloading',
+        pair,
+        file: f,
+        fileIndex: i + 1,
+        totalFiles: missing.length,
+        source,
+        time: Date.now(),
+      }
+      updateProgress(progress)
+      try {
+        writeFileSync(progressFile, JSON.stringify(progress))
+      } catch { /* best effort */ }
+      const ok = await downloadFile(url, dest, progressFile, f, missing)
       if (!ok) {
         allOk = false
         break
       }
     }
     if (allOk) {
+      // Mark complete
+      updateProgress({ status: 'complete', pair, dir, time: Date.now() })
+      try {
+        writeFileSync(progressFile, JSON.stringify({
+          status: 'complete',
+          pair,
+          dir,
+          time: Date.now(),
+        }))
+      } catch { /* best effort */ }
       logEvent('offline-downloaded', { pair, dir, source, files: missing.join(', ') })
       return dir
     }
     lastError = `source ${source}`
   }
+  // Mark failed
+  updateProgress({ status: 'failed', pair, error: lastError, time: Date.now() })
+  try {
+    writeFileSync(progressFile, JSON.stringify({
+      status: 'failed',
+      pair,
+      error: lastError,
+      time: Date.now(),
+    }))
+  } catch { /* best effort */ }
   throw new Error(
     `failed to download model for "${pair}" from all sources: ${sources.join(', ')}`)
 }
@@ -418,7 +535,7 @@ async function loadOffline(pair, config) {
  *  (flush the original block verbatim) applies, so a broken offline engine can
  *  never break a stream — but it also cannot silently degrade: every failure
  *  is logged with the pair, the model directory, and the elapsed time. */
-export async function translateOffline(text, pair, config, signal) {
+export async function translateOffline(text, pair, config, signal, targetLanguage) {
   if (text === '') return ''
   if (signal && signal.aborted) throw new Error('translation aborted')
 
@@ -445,7 +562,15 @@ export async function translateOffline(text, pair, config, signal) {
     if (toSend.length === 0) return parts.join('')
     if (toSend.every((s) => s.trim() === '')) return parts.join('')
 
-    const results = await translator.translateBatch(toSend, { beamSize: config.offlineBeamSize })
+    // NLLB models require a target language code as the decoder's first token
+    // (targetPrefix). Without it the model outputs garbage (e.g. French for a
+    // Chinese request). Opus-MT models do not use this parameter.
+    const isNllb = pair.startsWith('nllb-')
+    const targetPrefix = isNllb && targetLanguage ? nllbLangCode(targetLanguage) : undefined
+    const results = await translator.translateBatch(toSend, {
+      beamSize: config.offlineBeamSize,
+      ...(targetPrefix !== undefined ? { targetPrefix } : {}),
+    })
     if (!Array.isArray(results) || results.length !== toSend.length) {
       throw new Error(`offline engine returned ${results?.length ?? 0} results for ${toSend.length} segments`)
     }
@@ -456,7 +581,10 @@ export async function translateOffline(text, pair, config, signal) {
       if (part.placeholder) out.push(part.placeholder)
       else {
         const r = results[ri++]
-        out.push(typeof r === 'object' && r !== null && typeof r.text === 'string' ? r.text : String(r ?? ''))
+        // NLLB appends a trailing <unk> token; strip it for clean output.
+        let t = typeof r === 'object' && r !== null && typeof r.text === 'string' ? r.text : String(r ?? '')
+        if (isNllb && t.endsWith('<unk>')) t = t.slice(0, -5)
+        out.push(t)
       }
     }
 
@@ -568,6 +696,10 @@ export const Config = z.object({
   // waiting for first use. Empty = no prefetch. Cleared automatically after
   // download completes or fails.
   offlinePrefetchModel: z.string().default('').volatile(),
+  // Download progress status. Updated by the host during model download.
+  // Format: JSON string with { status, pair, file, fileIndex, totalFiles, ... }
+  // Empty when no download in progress. Read-only for the client.
+  downloadProgress: z.string().default('').volatile(),
 })
 
 /** Resolve 'auto' to a concrete language code. Prefers the client-pushed
@@ -2045,7 +2177,7 @@ async function translateSentence(text, config, signal, llm, currentModel, langua
       }
       const { pair } = resolveOfflinePair(source, language, config.offlinePair)
       if (!pair) return Promise.resolve(seg)
-      return translateOffline(seg, pair, config, signal)
+      return translateOffline(seg, pair, config, signal, language)
     }
     return isFreeEngine
       ? translateText(provider, seg, language, config.timeoutMs, signal)
@@ -2452,7 +2584,7 @@ async function* translateStream(original, config, signal, llm, currentModel) {
               const source = detected || 'en'
               const { pair } = resolveOfflinePair(source, language, config.offlinePair)
               if (!pair) return Promise.resolve(seg) // same language: nothing to do
-              return translateOffline(seg, pair, config, signal)
+              return translateOffline(seg, pair, config, signal, language)
             }
             return isFreeEngine
               ? translateText(provider, seg, language, config.timeoutMs, signal)
@@ -2612,6 +2744,41 @@ const translateAls = new AsyncLocalStorage()
 
 export const inject = ['llm']
 
+/** Write to a volatile config field. Volatile fields are read-only to plugins
+ *  via the public API (only `.get()`), but the runtime exposes a Symbol-keyed
+ *  setter used internally by the Loader's `_commitVolatile`. We use the same
+ *  global symbol so the plugin can push progress updates back to the client. */
+const _VOLATILE_WRITE = Symbol.for('cosmokit.volatile.write')
+function writeVolatile(field, value) {
+  if (field && typeof field[_VOLATILE_WRITE] === 'function') {
+    try { field[_VOLATILE_WRITE](value) } catch { /* best effort */ }
+  }
+}
+
+/** Trigger a model download. Called on plugin startup and on volatile-update
+ *  events when the client sets `offlinePrefetchModel`. */
+function doPrefetch(ctx, config, pair) {
+  if (!pair) return
+  logEvent('prefetch-start', { pair })
+  const prefetchConfig = {
+    offlineModelDir: config.offlineModelDir.get() || '',
+    offlineAutoDownload: true,
+    offlineModelSources: config.offlineModelSources.get() || [],
+    downloadProgress: {
+      set: (v) => { writeVolatile(config.downloadProgress, v) },
+    },
+  }
+  ensureModel(pair, prefetchConfig).then(() => {
+    logEvent('prefetch-complete', { pair })
+    writeVolatile(config.offlinePrefetchModel, '')
+    writeVolatile(config.downloadProgress, '')
+  }).catch((e) => {
+    logEvent('prefetch-failed', { pair, error: e.message })
+    writeVolatile(config.offlinePrefetchModel, '')
+    writeVolatile(config.downloadProgress, '')
+  })
+}
+
 export function apply(ctx, config) {
   const llm = ctx.get('llm')
 
@@ -2638,23 +2805,23 @@ export function apply(ctx, config) {
     offlineModels: listOfflineModels(cfg0.offlineModelDir),
   })
 
-  // Prefetch model if requested. The client sets offlinePrefetchModel to
-  // trigger a download; we run it here on startup and log the result.
-  if (cfg0.offlinePrefetchModel) {
-    const prefetchPair = cfg0.offlinePrefetchModel
-    logEvent('prefetch-start', { pair: prefetchPair })
-    ensureModel(prefetchPair, {
-      offlineModelDir: cfg0.offlineModelDir,
-      offlineAutoDownload: true,
-      offlineModelSources: cfg0.offlineModelSources,
-    }).then(() => {
-      logEvent('prefetch-complete', { pair: prefetchPair })
-      config.offlinePrefetchModel.set('') // Clear after success
-    }).catch((e) => {
-      logEvent('prefetch-failed', { pair: prefetchPair, error: e.message })
-      config.offlinePrefetchModel.set('') // Clear after failure too
-    })
+  // Prefetch model if requested at startup.
+  const prefetchModel = config.offlinePrefetchModel.get()
+  if (prefetchModel) {
+    doPrefetch(ctx, config, prefetchModel)
   }
+
+  // Listen for volatile-update events so the client can trigger a prefetch
+  // without restarting the plugin. The Loader emits 'loader/volatile-update'
+  // when a volatile field changes at runtime.
+  ctx.on('loader/volatile-update', (paths) => {
+    for (const p of paths) {
+      if (p.length === 1 && p[0] === 'offlinePrefetchModel') {
+        const pair = config.offlinePrefetchModel.get()
+        if (pair) doPrefetch(ctx, config, pair)
+      }
+    }
+  })
 
   // Re-entrancy guard: skip ONLY the llm/stream call this plugin itself issues
   // (translateWithLlm -> prepared.stream -> llm/stream), detected via the
