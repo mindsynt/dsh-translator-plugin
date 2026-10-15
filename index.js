@@ -1918,7 +1918,18 @@ async function translateSentence(text, config, signal, llm, currentModel, langua
   cacheSet(cacheKey, translated)
 
   // Step 9: Post-process (reinsert code/nouns, localize punctuation)
-  return postProcess(translated, spans, nounSpans, language)
+  const result = postProcess(translated, spans, nounSpans, language)
+
+  // Debug: log source and translation for quality review
+  logEvent('debug-translation', {
+    source: strippedNouns.slice(0, 200),
+    target: result.slice(0, 200),
+    detected, language, provider,
+    hadCode: spans.length > 0,
+    hadNouns: nounSpans.length > 0,
+  })
+
+  return result
 }
 
 /**
@@ -2341,6 +2352,14 @@ async function* translateStream(original, config, signal, llm, currentModel) {
             mode, provider, model, targetLanguage: language,
             elapsedMs: Date.now() - startedAt,
             textChars: fullText.length, outChars: finalText.length,
+          })
+          // Debug: log source and translation for quality review
+          logEvent('debug-block', {
+            source: strippedNouns.slice(0, 300),
+            target: finalText.slice(0, 300),
+            provider, language,
+            hadCode: spans.length > 0,
+            hadNouns: nounSpans.length > 0,
           })
           yield { ...chunk, block: { ...chunk.block, text: finalText } }
         } catch (e) {
