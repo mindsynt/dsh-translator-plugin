@@ -1798,6 +1798,8 @@ function findSentenceEnd(text, inCodeBlock) {
     if (!SENTENCE_END_CHARS.has(ch)) continue
     // Don't treat an abbreviation period as a sentence end.
     if (ch === '.' && isAbbreviation(text, i)) continue
+    // Don't treat a decimal/version period as a sentence end (e.g. "1.0", "v2.5", "3.14").
+    if (ch === '.' && /\d/.test(text[i - 1] || '') && /\d/.test(text[i + 1] || '')) continue
     // Must be followed by whitespace, end-of-text, or a closing bracket.
     const next = text[i + 1]
     if (next === undefined) return i + 1
@@ -1842,7 +1844,7 @@ async function translateSentence(text, config, signal, llm, currentModel, langua
   if (!strippedNouns.trim()) return text
 
   // Step 3: Detect source language
-  const detected = proseLanguage(strippedNouns)
+  let detected = proseLanguage(strippedNouns)
 
   // Step 4: Resolve provider and model (same logic as block-end path)
   const mode = config.provider
@@ -1872,7 +1874,15 @@ async function translateSentence(text, config, signal, llm, currentModel, langua
   const glossaryContext = isFreeEngine ? undefined : [...glossary]
   const translateFn = (seg) => {
     if (provider === 'opus') {
-      const source = detected || 'en'
+      let source = detected || 'en'
+      // Mixed-language guard: if the detected source is the same as the
+      // target but the text still has substantial Latin-script prose,
+      // force en→target so English words inside CJK sentences are
+      // actually translated instead of passed through unchanged.
+      if (source === languageFamily(language)) {
+        const nonPlaceholder = strippedNouns.replace(/\[\[⟪\*?\d+⟫\]\]/g, '')
+        if (/[a-zA-Z]{2,}/.test(nonPlaceholder)) source = 'en'
+      }
       const { pair } = resolveOfflinePair(source, language, config.offlinePair)
       if (!pair) return Promise.resolve(seg)
       return translateOffline(seg, pair, config, signal)
@@ -2191,23 +2201,28 @@ async function* translateStream(original, config, signal, llm, currentModel) {
           // identical "translation" — flush the original block verbatim.
           // Conservative (see proseLanguage): only CJK targets where the
           // script unambiguously matches; Latin targets always translate.
-          const detected = proseLanguage(strippedNouns)
+          let detected = proseLanguage(strippedNouns)
           if (detected !== null
             && normalizeLanguage(detected, provider) === normalizeLanguage(language, provider)) {
-            // This is the branch that most often looks like "the plugin does
-            // nothing": the prose is already the target language, so it is
-            // flushed verbatim. Log it, because the alternative explanation
-            // (a broken translation route) produces no evidence at all.
-            logEvent('skip', {
-              reason: 'already-target-language',
-              what: `block ${chunk.index} (${blockType || 'unknown'})`,
-              mode, provider, model,
-              detectedLanguage: detected, targetLanguage: language,
-              textChars: fullText.length,
-            })
-            const finalText = reinsertNouns(reinsertCode(fullText, spans), nounSpans)
-            yield { ...chunk, block: { ...chunk.block, text: finalText } }
-            break
+            // Mixed-language guard: if the block has substantial English
+            // content, don't skip — force the source to 'en' so the
+            // translation pipeline processes it.
+            const nonPlaceholder = strippedNouns.replace(/\[\[⟪\*?\d+⟫\]\]/g, '')
+            if (/[a-zA-Z]{2,}/.test(nonPlaceholder)) {
+              detected = 'en'
+            } else {
+              // No English content — already target language, skip.
+              logEvent('skip', {
+                reason: 'already-target-language',
+                what: `block ${chunk.index} (${blockType || 'unknown'})`,
+                mode, provider, model,
+                detectedLanguage: detected, targetLanguage: language,
+                textChars: fullText.length,
+              })
+              const finalText = reinsertNouns(reinsertCode(fullText, spans), nounSpans)
+              yield { ...chunk, block: { ...chunk.block, text: finalText } }
+              break
+            }
           }
 
           // Step 5: Cache check — skip the translation call entirely if this
