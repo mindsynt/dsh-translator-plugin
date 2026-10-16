@@ -895,9 +895,14 @@ function reinsertCode(translated, spans) {
   let result = translated
   const used = []
   for (let i = 0; i < spans.length; i++) {
+    // Check both plain [[⟪n⟫]] and starred [[⟪*n⟫]] placeholders
     const placeholder = `[[⟪${i}⟫]]`
+    const starredPlaceholder = `[[⟪*${i}⟫]]`
     if (result.includes(placeholder)) {
       result = result.split(placeholder).join(spans[i])
+      used[i] = true
+    } else if (result.includes(starredPlaceholder)) {
+      result = result.split(starredPlaceholder).join(spans[i])
       used[i] = true
     }
   }
@@ -907,7 +912,7 @@ function reinsertCode(translated, spans) {
     if (!used[i]) tail += spans[i]
   }
   // Remove any placeholder text that survived (defensive) before appending.
-  result = result.replace(/\[\[⟪\d+⟫\]\]/g, '')
+  result = result.replace(/\[\[⟪\*?\d+⟫\]\]/g, '')
   return result + tail
 }
 
