@@ -728,53 +728,6 @@ function extractCode(text) {
 
   return { stripped, spans }
 }
-/**
- * Split text by code blocks (inline and fenced) for segment translation.
- * Code blocks are kept as-is (not translated), only text segments are translated.
- * This avoids placeholder issues entirely.
- *
- * @param text - raw block text possibly containing code.
- * @returns segments with {type: 'text'|'code', content: string}
- */
-function splitByCodeBlocks(text) {
-  const segments = []
-  // Match fenced code blocks and inline code
-  const regex = /(```[\s\S]*?```|~~~[\s\S]*?~~~|`[^`\n]+`)/g
-  let lastIndex = 0
-  let match
-  
-  while ((match = regex.exec(text)) !== null) {
-    if (match.index > lastIndex) {
-      segments.push({ type: 'text', content: text.substring(lastIndex, match.index) })
-    }
-    segments.push({ type: 'code', content: match[0] })
-    lastIndex = match.index + match[0].length
-  }
-  if (lastIndex < text.length) {
-    segments.push({ type: 'text', content: text.substring(lastIndex) })
-  }
-  if (segments.length === 0) {
-    segments.push({ type: 'text', content: text })
-  }
-  return segments
-}
-
-/**
- * Translate text using segment translation approach.
- * Code blocks are preserved as-is, only text segments are translated.
- */
-async function translateBySegments(text, translateFn) {
-  const segments = splitByCodeBlocks(text)
-  if (segments.length === 1 && segments[0].type === 'text') {
-    return translateFn(text)
-  }
-  for (const seg of segments) {
-    if (seg.type === 'text' && seg.content.trim() !== '') {
-      seg.content = await translateFn(seg.content)
-    }
-  }
-  return segments.map(s => s.content).join('')
-}
 
 
 /** Replace each `[[⟪n⟫]]` placeholder in `translated` with the matching
@@ -1088,38 +1041,24 @@ function reinsertNouns(translated, spans) {
 }
 
 /**
- * Finalize one translated block. Two always-on steps plus one zh-only step:
+ * Finalize one translated block. One zh-only step:
  *
- *  1. reinsertCode / reinsertNouns — code spans and proper nouns are put back
- *     verbatim regardless of target language.
- *  2. The presentation rewrite (punctuation, brackets, numbers, abbreviations,
- *     ordinals) is applied ONLY when the target language is Chinese. Every one
- *     of those transforms is hard-coded to zh conventions (。？！、（）、年月日、
- *     美元、第X), so running it for an en/fr/de/es/ja/ko target corrupts the
- *     translation instead of polishing it — an English→English pass gained
- *     Chinese full-width brackets and turned "e.g." into "等等".
+ *  The presentation rewrite (punctuation, brackets, numbers, abbreviations,
+ *  ordinals) is applied ONLY when the target language is Chinese. Every one
+ *  of those transforms is hard-coded to zh conventions (。？！、（）、年月日、
+ *  美元、第X), so running it for an en/fr/de/es/ja/ko target corrupts the
+ *  translation instead of polishing it.
  *
- * @param translated - the raw translated prose (placeholders still in place).
- * @param codeSpans - spans saved by extractCode, in placeholder order.
- * @param nounSpans - spans saved by extractNouns, in placeholder order.
+ * Code blocks are preserved as-is via segment translation (see translateBySegments),
+ * so no placeholder reinsertion is needed here.
+ *
+ * @param translated - the translated text (code blocks already preserved).
+ * @param _codeSpans - unused (kept for signature compatibility).
+ * @param _nounSpans - unused (kept for signature compatibility).
  * @param targetLanguage - the resolved target language tag.
  */
-function postProcess(translated, codeSpans, nounSpans, targetLanguage) {
-  let result = reinsertNouns(reinsertCode(translated, codeSpans), nounSpans)
-  // Safety net: remove any remaining placeholder-like patterns that the
-  // translation model may have created by translating the placeholder tokens.
-  // The specific cleanup in reinsertCode/reinsertNouns handles the exact
-  // [[⟪n⟫]] / [[⟪*n⟫]] format; this catches any translated variants (e.g.
-  // [[代码3]], [[Код3]]) that slipped through. The pattern matches
-  // [[word+digit]] where word is 1–16 chars that are not brackets, spaces,
-  // or digits — broad enough to catch most translations, narrow enough to
-  // avoid matching legitimate text like [[chapter 5]] (has a space).
-  result = result.replace(/\[\[[^\]\s\d\n]{1,16}\d+\]\]/g, (match) => {
-    // Don't remove if it's still a valid [[⟪n⟫]] or [[⟪*n⟫]] placeholder
-    // that reinsertCode/reinsertNouns should have handled — those would have
-    // been cleaned already. This catches anything else.
-    return ''
-  })
+function postProcess(translated, _codeSpans, _nounSpans, targetLanguage) {
+  let result = translated
   if (languageFamily(targetLanguage) !== 'zh') return result
   return localizePunctuation(
     localizeBrackets(
@@ -2060,25 +1999,17 @@ function trackCodeFence(deltaText, inCodeBlock) {
 const SENTENCE_MIN_CHARS = 10
 
 /** Translate a single sentence for sentence-mode streaming.
- *  Same pipeline as the block-end path (extractCode → extractNouns →
+ *  Uses segment translation: code blocks preserved as-is, only text translated.
  *  translate → postProcess) but on a single sentence, with caching.
  *  Resolves provider/model the same way as the block-end path.
  *  On failure, falls back to the original text (never breaks the stream). */
 async function translateSentence(text, config, signal, llm, currentModel, language) {
   if (!text || text.trim() === '') return text
 
-  // Step 1: Extract code spans (protect code from translation)
-  const { stripped, spans } = extractCode(text)
+  // Detect source language on original text (before segment splitting)
+  let detected = proseLanguage(text)
 
-  // Step 2: Extract proper nouns
-  const { stripped: strippedNouns, spans: nounSpans } = extractNouns(stripped)
-
-  if (!strippedNouns.trim()) return text
-
-  // Step 3: Detect source language
-  let detected = proseLanguage(strippedNouns)
-
-  // Step 4: Resolve provider and model (same logic as block-end path)
+  // Resolve provider and model (same logic as block-end path)
   const mode = config.provider
   let provider, model
   const isOfflineMode = mode === 'opus'
@@ -2089,35 +2020,26 @@ async function translateSentence(text, config, signal, llm, currentModel, langua
     provider = (await providerForModel(llm, config.model)) ?? currentModel.provider
     model = config.model === 'auto' ? currentModel.model : config.model
   } else {
-    // 'auto' — follow the current conversation
     provider = currentModel.provider
     model = currentModel.model
   }
 
-  // Step 5: Cache check
+  // Cache check (key on original text)
   const isFreeEngine = provider === 'bing' || provider === 'google' || provider === 'opus'
-  const cacheKey = hashKey(strippedNouns, language, provider)
+  const cacheKey = hashKey(text, language, provider)
   const cached = cacheGet(cacheKey)
   if (cached !== undefined) {
-    return postProcess(cached, spans, nounSpans, language)
+    return postProcess(cached, null, null, language)
   }
 
-  // Step 6: Build the translate function
+  // Build the translate function
   const glossaryContext = isFreeEngine ? undefined : [...glossary]
   const translateFn = (seg) => {
     if (provider === 'opus') {
       let source = detected || 'en'
-      // Mixed-language guard: if the detected source is the same as the
-      // target but the text still has substantial Latin-script prose,
-      // force en→target so English words inside CJK sentences are
-      // actually translated instead of passed through unchanged.
-      // Only match words surrounded by spaces/punctuation, not identifiers
-      // like snake_case (ask_user_question) or leading-underscore (_question).
+      // Mixed-language guard: force en→target if text has Latin-script prose
       if (source === languageFamily(language)) {
-        const nonPlaceholder = strippedNouns.replace(/\[\[⟪\*?\d+⟫\]\]/g, '')
-        // Match English words: 2+ letters, preceded by space/punctuation/start,
-        // followed by space/punctuation/end. This excludes snake_case identifiers.
-        const hasEnglish = /(?:^|[\s\.,;:!?])[a-zA-Z]{2,}(?=[\s\.,;:!?]|$)/.test(nonPlaceholder)
+        const hasEnglish = /(?:^|[\s\.,;:!?])[a-zA-Z]{2,}(?=[\s\.,;:!?]|$)/.test(seg)
         if (hasEnglish) source = 'en'
       }
       const { pair } = resolveOfflinePair(source, language, config.offlinePair)
@@ -2129,22 +2051,18 @@ async function translateSentence(text, config, signal, llm, currentModel, langua
       : translateWithLlm(llm, provider, model, seg, language, config.timeoutMs, signal, glossaryContext)
   }
 
-  // Step 7: Translate (single sentence — no long-text splitting needed)
+  // Translate using segment approach — code blocks are preserved as-is
   let translated
   try {
-    translated = await translateFn(strippedNouns)
+    translated = await translateBySegments(text, translateFn)
   } catch (_e) {
-    // Fallback to original text on failure — sentence mode must degrade
-    // gracefully per-sentence so one failed translation doesn't kill the stream.
     return text
   }
 
-  // Step 7.5: Garbled detection — Opus-MT sometimes outputs garbage like
-  // repeated chars ("aaaa..."), padding ("====..."), or RTF codes ("\fn...").
-  // Detect these and fall back to original text.
-  if (isGarbled(strippedNouns, translated)) {
+  // Garbled detection
+  if (isGarbled(text, translated)) {
     logEvent('garbled-fallback', {
-      source: strippedNouns.slice(0, 100),
+      source: text.slice(0, 100),
       target: translated.slice(0, 100),
       provider,
       detected,
@@ -2153,19 +2071,20 @@ async function translateSentence(text, config, signal, llm, currentModel, langua
     return text
   }
 
-  // Step 8: Cache
+  // Cache
   cacheSet(cacheKey, translated)
 
-  // Step 9: Post-process (reinsert code/nouns, localize punctuation)
-  const result = postProcess(translated, spans, nounSpans, language)
+  // Post-process (punctuation localization only)
+  const result = postProcess(translated, null, null, language)
 
-  // Debug: log source and translation for quality review
+  // Debug log
+  const segments = splitByCodeBlocks(text)
+  const hadCode = segments.some(s => s.type === 'code')
   logEvent('debug-translation', {
-    source: strippedNouns.slice(0, 200),
+    source: text.slice(0, 200),
     target: result.slice(0, 200),
     detected, language, provider,
-    hadCode: spans.length > 0,
-    hadNouns: nounSpans.length > 0,
+    hadCode,
   })
 
   return result
@@ -2421,30 +2340,23 @@ async function* translateStream(original, config, signal, llm, currentModel) {
         let provider, model
         const startedAt = Date.now()
         try {
-          // Step 1: Strip code blocks/inline code so they are never translated.
-          const { stripped, spans } = extractCode(fullText)
+          // Step 1: Split by code blocks (segment translation approach)
+          const segments = splitByCodeBlocks(fullText)
+          const textContent = segments.filter(s => s.type === 'text').map(s => s.content).join('')
 
-          // Step 2: Protect proper nouns (brand names, CamelCase words,
-          // acronyms) so the translation service never touches them.
-          const { stripped: strippedNouns, spans: nounSpans } = extractNouns(stripped)
-
-          // Step 3: Short-block skip — a very short block without
+          // Step 2: Short-block skip — a very short block without
           // sentence-ending punctuation gains nothing from translation.
-          if (shouldSkipShortBlock(strippedNouns.trim())) {
-            // Pass through the original text verbatim.
+          if (shouldSkipShortBlock(textContent.trim())) {
             logEvent('skip', {
               reason: 'short-block',
               what: `block ${chunk.index} (${blockType || 'unknown'})`,
               mode, targetLanguage: language, textChars: fullText.length,
             })
-            const finalText = reinsertNouns(reinsertCode(fullText, spans), nounSpans)
-            yield { ...chunk, block: { ...chunk.block, text: finalText } }
+            yield { ...chunk, block: { ...chunk.block, text: fullText } }
             break
           }
 
-          // The offline engine is a third "free engine": it never calls a model
-          // and never hits the network, so it shares the free-engine path and
-          // inherits the same glossary/timeout semantics.
+          // Resolve provider and model
           const isOfflineMode = mode === 'opus'
           if (mode === 'bing' || mode === 'google' || isOfflineMode) {
             provider = mode
@@ -2453,30 +2365,18 @@ async function* translateStream(original, config, signal, llm, currentModel) {
             provider = (await providerForModel(llm, config.model)) ?? currentModel.provider
             model = config.model === 'auto' ? currentModel.model : config.model
           } else {
-            // 'auto' — follow the current conversation entirely.
             provider = currentModel.provider
             model = currentModel.model
           }
 
-          // Step 4: Same-language skip: if the prose is confidently already in
-          // the target language, don't waste a translation call or show a fake,
-          // identical "translation" — flush the original block verbatim.
-          // Conservative (see proseLanguage): only CJK targets where the
-          // script unambiguously matches; Latin targets always translate.
-          let detected = proseLanguage(strippedNouns)
+          // Same-language skip: detect on text content only
+          let detected = proseLanguage(textContent)
           if (detected !== null
             && normalizeLanguage(detected, provider) === normalizeLanguage(language, provider)) {
-            // Mixed-language guard: if the block has substantial English
-            // content, don't skip — force the source to 'en' so the
-            // translation pipeline processes it.
-            // Only match words surrounded by spaces/punctuation, not identifiers
-            // like snake_case (ask_user_question) or leading-underscore (_question).
-            const nonPlaceholder = strippedNouns.replace(/\[\[⟪\*?\d+⟫\]\]/g, '')
-            const hasEnglish = /(?:^|[\s\.,;:!?])[a-zA-Z]{2,}(?=[\s\.,;:!?]|$)/.test(nonPlaceholder)
+            const hasEnglish = /(?:^|[\s\.,;:!?])[a-zA-Z]{2,}(?=[\s\.,;:!?]|$)/.test(textContent)
             if (hasEnglish) {
               detected = 'en'
             } else {
-              // No English content — already target language, skip.
               logEvent('skip', {
                 reason: 'already-target-language',
                 what: `block ${chunk.index} (${blockType || 'unknown'})`,
@@ -2484,19 +2384,14 @@ async function* translateStream(original, config, signal, llm, currentModel) {
                 detectedLanguage: detected, targetLanguage: language,
                 textChars: fullText.length,
               })
-              const finalText = reinsertNouns(reinsertCode(fullText, spans), nounSpans)
-              yield { ...chunk, block: { ...chunk.block, text: finalText } }
+              yield { ...chunk, block: { ...chunk.block, text: fullText } }
               break
             }
           }
 
-          // Step 5: Cache check — skip the translation call entirely if this
-          // exact (source, target, provider) triple was already translated.
-          // The offline engine supports no prompt context, so it is treated as a
-          // free engine here: the same glossary is withheld from it, and the
-          // same fallback-to-original-text guarantee applies.
+          // Cache check
           const isFreeEngine = provider === 'bing' || provider === 'google' || provider === 'opus'
-          const cacheKey = hashKey(strippedNouns, language, provider)
+          const cacheKey = hashKey(fullText, language, provider)
           const cached = cacheGet(cacheKey)
           if (cached !== undefined) {
             logEvent('skip', {
@@ -2505,51 +2400,31 @@ async function* translateStream(original, config, signal, llm, currentModel) {
               mode, provider, model, targetLanguage: language,
               textChars: fullText.length,
             })
-            const finalText = postProcess(cached, spans, nounSpans, language)
+            const finalText = postProcess(cached, null, null, language)
             yield { ...chunk, block: { ...chunk.block, text: finalText } }
             break
           }
 
-          // Step 6: Translate the (possibly long) block in provider-sized
-          // segments so there is no upper length cap. maxTextChars is the
-          // per-request segment size, NOT a hard skip limit.
-          // For model providers, inject the recent glossary for consistent
-          // terminology. Free engines don't support context, so glossary is
-          // only passed for model routes.
+          // Translate using segment approach — code blocks are preserved as-is
           const glossaryContext = isFreeEngine ? undefined : [...glossary]
           const translateSegment = (seg, m) => {
             if (provider === 'opus') {
-              // The offline model is per language pair and directional — an
-              // `en-zh` model does not translate Chinese into English. The pair
-              // comes from the configured offlinePair, or is inferred from this
-              // block's detected language plus the target language. A block
-              // whose script identifies no language (pure Latin) defaults to
-              // English, which is by far the common case for text this plugin
-              // ever sees.
               const source = detected || 'en'
               const { pair } = resolveOfflinePair(source, language, config.offlinePair)
-              if (!pair) return Promise.resolve(seg) // same language: nothing to do
+              if (!pair) return Promise.resolve(seg)
               return translateOffline(seg, pair, config, signal, language)
             }
             return isFreeEngine
               ? translateText(provider, seg, language, config.timeoutMs, signal)
               : translateWithLlm(llm, provider, m || DEFAULT_MODEL, seg, language, config.timeoutMs, signal, glossaryContext)
           }
-          // Offline segments are capped below maxTextChars (the model's 512-token
-          // context) and run serially (synchronous CPU), so their latency adds
-          // up honestly instead of overlapping.
-          const isOffline = provider === 'opus'
-          const segmentChunkSize = isOffline ? Math.min(config.maxTextChars, OPUS_MAX_CHARS) : config.maxTextChars
-          const segmentConcurrency = isOffline ? OPUS_SEGMENT_CONCURRENCY : SEGMENT_CONCURRENCY
-          const runTranslate = (m) =>
-            translateLong((seg) => translateSegment(seg, m), strippedNouns, segmentChunkSize, segmentConcurrency)
+          // Build a translate function that uses translateBySegments
+          const translateFn = (text) => translateBySegments(text, translateSegment)
+
           let translated
           try {
-            translated = await runTranslate(model)
+            translated = await translateFn(fullText)
           } catch (e) {
-            // If the chosen model is unknown to the resolved provider, fall
-            // back to the current conversation's model instead of dropping.
-            // Logged, because a silently swapped route is otherwise invisible.
             if (!isFreeEngine && currentModel.model && currentModel.model !== model) {
               logEvent('fallback', {
                 what: `block ${chunk.index} (${blockType || 'unknown'})`,
@@ -2564,38 +2439,33 @@ async function* translateStream(original, config, signal, llm, currentModel) {
               )
               provider = currentModel.provider
               model = currentModel.model
-              translated = await runTranslate(model)
+              translated = await translateFn(fullText)
             } else {
               throw e
             }
           }
 
-          // Step 6.5: Garbled detection — Opus-MT sometimes outputs garbage.
-          // Check the full translation result and fall back to original.
-          if (isGarbled(strippedNouns, translated)) {
+          // Garbled detection
+          if (isGarbled(fullText, translated)) {
             logEvent('garbled-fallback', {
               what: `block ${chunk.index} (${blockType || 'unknown'})`,
-              source: strippedNouns.slice(0, 100),
+              source: fullText.slice(0, 100),
               target: translated.slice(0, 100),
               provider, mode,
             })
-            const finalText = reinsertNouns(reinsertCode(fullText, spans), nounSpans)
-            yield { ...chunk, block: { ...chunk.block, text: finalText } }
+            yield { ...chunk, block: { ...chunk.block, text: fullText } }
             break
           }
 
-          // Step 7: Reinsert code + noun placeholders, then apply the
-          // Chinese-only presentation rewrite (see postProcess).
-          const finalText = postProcess(translated, spans, nounSpans, language)
+          // Post-process (punctuation localization only)
+          const finalText = postProcess(translated, null, null, language)
 
-          // Step 8: Cache the result for future lookups.
+          // Cache
           cacheSet(cacheKey, translated)
 
-          // Step 9: Extract glossary terms from this translation for
-          // consistent terminology in subsequent blocks. Only for model
-          // providers (bing/google don't benefit from context).
+          // Extract glossary terms
           if (!isFreeEngine) {
-            const terms = extractGlossaryTerms(strippedNouns, translated)
+            const terms = extractGlossaryTerms(textContent, finalText)
             pushGlossary(terms)
           }
 
@@ -2610,12 +2480,12 @@ async function* translateStream(original, config, signal, llm, currentModel) {
             textChars: fullText.length, outChars: finalText.length,
           })
           // Debug: log source and translation for quality review
+          const hadCode = segments.some(s => s.type === 'code')
           logEvent('debug-block', {
-            source: strippedNouns.slice(0, 300),
+            source: fullText.slice(0, 300),
             target: finalText.slice(0, 300),
             provider, language,
-            hadCode: spans.length > 0,
-            hadNouns: nounSpans.length > 0,
+            hadCode,
           })
           yield { ...chunk, block: { ...chunk.block, text: finalText } }
         } catch (e) {
