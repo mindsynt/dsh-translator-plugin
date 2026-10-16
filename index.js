@@ -1118,19 +1118,50 @@ function isGarbled(source, target) {
   if (!target || target.length === 0) return true
   if (source.length === 0) return false
 
-  // 1. Repeated single character runs (3+ same chars)
-  const repeatCount = (target.match(/(.)\1{2,}/g) || []).length
-  if (repeatCount > 0) return true
+  // 1. Repeated single character runs (3+ same chars). Opus pads garbage with
+  // runs of one symbol ("________________", "{{{{{{}}}}", "======"), whitespace
+  // runs, CJK stutter ("卡卡卡卡卡"), or ellipsis padding ("洞察力... 测试...").
+  // Only digit runs are exempt: they appear exclusively inside natural amounts
+  // and IDs ("1250000", "210000").
+  const runs = target.match(/(.)\1{2,}/g) || []
+  for (const run of runs) {
+    const ch = run[0]
+    const code = ch.charCodeAt(0)
+    if (code >= 0x30 && code <= 0x39) continue
+    return true
+  }
+
+  // 1b. Space-separated runs ("= = = = = =", "_ _ _ _") — Opus padding that
+  // rule 1 above cannot catch, because whitespace breaks the contiguous run.
+  // Letters and digits are exempt (a spaced-out word or amount is not
+  // padding), everything else at 3+ is.
+  const spacedRuns = target.match(/(\S)\s+\1\s+\1/g) || []
+  for (const sr of spacedRuns) {
+    const ch = sr[0]
+    const code = ch.charCodeAt(0)
+    if (code >= 0x30 && code <= 0x39) continue
+    if (/\p{L}/u.test(ch)) continue
+    return true
+  }
 
   // 2. Word format codes (RTF-like)
   if (/\\[a-z]{2,}[0-9a-fA-F]+/.test(target)) return true
 
-  // 3. Excessive special characters (>30% non-printable/non-CJK)
-  const specialCount = target.split('').filter(c => {
+  // 3. Excessive special characters (>30% non-printable/non-CJK).
+  // ASCII whitespace (\t \n \r space) is dropped from numerator and
+  // denominator alike: a short block that merely opens with newlines
+  // ("\n\n让我写。") was counted as 2/6 = 33% special and wrongly rejected.
+  // The tighter denominator also means whitespace-padded garbage
+  // ("   ⁇   ⁇   ⁇   ") can no longer hide behind padding spaces.
+  const chars = target.split('').filter(c => {
+    const code = c.charCodeAt(0)
+    return code !== 9 && code !== 10 && code !== 13 && code !== 32
+  })
+  const specialCount = chars.filter(c => {
     const code = c.charCodeAt(0)
     return code < 32 || (code >= 0x80 && code < 0x2000) || c === '\u2047'
   }).length
-  if (specialCount / target.length > 0.3) return true
+  if (chars.length > 0 && specialCount / chars.length > 0.3) return true
 
   // 4. Output too long (>3x source length, likely padding)
   if (target.length > source.length * 3 && source.length > 10) return true
