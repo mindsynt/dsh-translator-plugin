@@ -122,7 +122,7 @@ function nllbLangCode(tag) {
   // Use Hans (simplified) for zh by default; switch to Hant if the tag says so
   if (code === 'zh') {
     return /hant|hk|tw/i.test(tag) ? 'zho_Hant' : 'zho_Hans'
-  }
+
   const MAP = {
     en: 'eng_Latn', fr: 'fra_Latn', de: 'deu_Latn', es: 'spa_Latn',
     pt: 'por_Latn', it: 'ita_Latn', ru: 'rus_Cyrl', nl: 'nld_Latn',
@@ -171,7 +171,7 @@ function offlineRoot() {
 }
 
 /** Resolve a pair's model directory. Search order:
- *  1. The configured override (offlineModelDir), if set.
+ *  1. The plugin's default model directory.
  *  2. The models bundled with the plugin (so a fresh install works offline).
  *  3. The Harness home default, where downloaded models are cached.
  *  The first directory that holds a complete model wins. */
@@ -297,144 +297,13 @@ async function downloadFile(url, dest, progressFile, currentFile, totalFiles) {
  *  from the configured model sources when `autoDownload` is on. Resolves to
  *  the directory path on success, or throws with a message that names what
  *  was tried. Tries each source in order until one succeeds.
- *  Updates downloadProgress in config if provided. */
+ */
 async function ensureModel(pair, config) {
-  const dir = modelDirFor(pair, config.offlineModelDir)
+  const dir = modelDirFor(pair, '')
   if (modelLooksComplete(dir)) return dir
-
-  if (!config.offlineAutoDownload) {
-    throw new Error(
-      `offline model for "${pair}" not found — the plugin ships with en-zh bundled; ` +
-      `for "${pair}" either enable offlineAutoDownload, or place the model files ` +
-      `in ${dir}`)
-  }
-
-  const sources = config.offlineModelSources?.length > 0
-    ? config.offlineModelSources
-    : DEFAULT_MODEL_SOURCES
-
-  // Determine model type and files to download
-  let repo, requiredFiles
-  if (pair.startsWith('nllb-')) {
-    // NLLB model
-    const variant = pair.replace('nllb-', '')
-    repo = NLLB_REPOS[variant]
-    if (!repo) {
-      throw new Error(`unknown NLLB variant "${variant}"; available: ${Object.keys(NLLB_REPOS).join(', ')}`)
-    }
-    requiredFiles = MODEL_FILES_NLLB
-  } else {
-    // Opus-MT model
-    repo = HF_REPO(pair)
-    requiredFiles = MODEL_FILES_OPUS
-  }
-
-  const missing = requiredFiles.filter(f => {
-    const dest = path.join(dir, f)
-    return !(existsSync(dest) && statSync(dest).size > 0)
-  })
-
-  if (missing.length === 0) {
-    logEvent('offline-download', { pair, dir, source: 'cached', files: [] })
-    return dir
-  }
-
-  logEvent('offline-download', { pair, dir, source: sources[0], files: missing.join(', ') })
-  mkdirSync(dir, { recursive: true })
-
-  // Update progress via config if available
-  const updateProgress = (data) => {
-    if (config.downloadProgress && config.downloadProgress.set) {
-      try { config.downloadProgress.set(JSON.stringify(data)) } catch { /* best effort */ }
-    }
-  }
-
-  // Create progress file for tracking download progress
-  const progressFile = path.join(dir, '.download-progress')
-  updateProgress({
-    status: 'downloading',
-    pair,
-    totalFiles: missing.length,
-    files: missing,
-    currentFile: null,
-    time: Date.now(),
-  })
-  try {
-    writeFileSync(progressFile, JSON.stringify({
-      status: 'downloading',
-      pair,
-      totalFiles: missing.length,
-      files: missing,
-      currentFile: null,
-      time: Date.now(),
-    }))
-  } catch { /* best effort */ }
-
-  let lastError = null
-  for (const source of sources) {
-    let allOk = true
-    for (let i = 0; i < missing.length; i++) {
-      const f = missing[i]
-      const dest = path.join(dir, f)
-      // Build URL based on source type
-      let url
-      if (source.includes('huggingface.co') || source.includes('hf-mirror.com')) {
-        url = `${source}/${repo}/resolve/main/${f}`
-      } else if (source.includes('modelscope.cn')) {
-        url = `${source}/${repo}/resolve/master/${f}`
-      } else if (source.includes('openxlab.org.cn')) {
-        url = `${source}/${repo}/resolve/master/${f}`
-      } else {
-        url = `${source}/${repo}/resolve/main/${f}`
-      }
-      // Update progress before download
-      const progress = {
-        status: 'downloading',
-        pair,
-        file: f,
-        fileIndex: i + 1,
-        totalFiles: missing.length,
-        source,
-        time: Date.now(),
-      }
-      updateProgress(progress)
-      try {
-        writeFileSync(progressFile, JSON.stringify(progress))
-      } catch { /* best effort */ }
-      const ok = await downloadFile(url, dest, progressFile, f, missing)
-      if (!ok) {
-        allOk = false
-        break
-      }
-    }
-    if (allOk) {
-      // Mark complete
-      updateProgress({ status: 'complete', pair, dir, time: Date.now() })
-      try {
-        writeFileSync(progressFile, JSON.stringify({
-          status: 'complete',
-          pair,
-          dir,
-          time: Date.now(),
-        }))
-      } catch { /* best effort */ }
-      logEvent('offline-downloaded', { pair, dir, source, files: missing.join(', ') })
-      return dir
-    }
-    lastError = `source ${source}`
-  }
-  // Mark failed
-  updateProgress({ status: 'failed', pair, error: lastError, time: Date.now() })
-  try {
-    writeFileSync(progressFile, JSON.stringify({
-      status: 'failed',
-      pair,
-      error: lastError,
-      time: Date.now(),
-    }))
-  } catch { /* best effort */ }
   throw new Error(
-    `failed to download model for "${pair}" from all sources: ${sources.join(', ')}`)
+    'offline model for "' + pair + '" not found. Only Opus-MT en-zh is bundled. ' +
+    'Place model files in ' + dir)
 }
 
 /** LRU of loaded translators by model directory. Holding them open is the
@@ -670,36 +539,10 @@ export const Config = z.object({
   // NLLB models support 200 languages natively: use 'nllb-600m', 'nllb-int8',
   // 'nllb-1.3b', or 'nllb-3.3b' for automatic language detection.
   offlinePair: z.string().default('auto').volatile(),
-  // Directory holding the per-pair model directories (config.json / model.bin /
-  // shared_vocabulary.json / source.spm / target.spm). Empty = the plugin's
-  // own default under $DSH_HOME/model-translator/models.
-  offlineModelDir: z.string().default('').volatile(),
-  // CPU threads handed to the CTranslate2 backend. Measured on this host, 4
-  // threads is ~1.3x faster than 2 for a ~1800-char English segment, and the
-  // marginal gain flattens past that. Bounded because a runaway value would
-  // oversubscribe the machine on every translation call.
+  // CPU threads handed to the CTranslate2 backend.
   offlineThreads: z.natural().min(1).max(32).default(4).volatile(),
-  // Beam search width. 4 matches the CTranslate2 default and is the best
-  // quality/cost point for Marian; 1 is much faster but visibly worse.
+  // Beam search width.
   offlineBeamSize: z.natural().min(1).max(12).default(4).volatile(),
-  // Whether to download an additional model automatically on first use, when
-  // the pair is not already bundled with the plugin or cached locally. Off by
-  // default so a fresh install stays fully offline; turn it on to fetch other
-  // language pairs from the public gaudi ctranslate2 conversion on HuggingFace.
-  offlineAutoDownload: z.boolean().default(false).volatile(),
-  // Model download sources, tried in order when the first fails. Useful for
-  // regions where HuggingFace is blocked — hf-mirror.com, modelscope.cn, and
-  // openxlab.org.cn mirror the same gaudi/opus-mt repositories. Empty = use
-  // built-in defaults.
-  offlineModelSources: z.array(z.string()).default([]).volatile(),
-  // Model to prefetch on plugin start. Set this to download a model without
-  // waiting for first use. Empty = no prefetch. Cleared automatically after
-  // download completes or fails.
-  offlinePrefetchModel: z.string().default('').volatile(),
-  // Download progress status. Updated by the host during model download.
-  // Format: JSON string with { status, pair, file, fileIndex, totalFiles, ... }
-  // Empty when no download in progress. Read-only for the client.
-  downloadProgress: z.string().default('').volatile(),
 })
 
 /** Resolve 'auto' to a concrete language code. Prefers the client-pushed
@@ -885,6 +728,54 @@ function extractCode(text) {
 
   return { stripped, spans }
 }
+/**
+ * Split text by code blocks (inline and fenced) for segment translation.
+ * Code blocks are kept as-is (not translated), only text segments are translated.
+ * This avoids placeholder issues entirely.
+ *
+ * @param text - raw block text possibly containing code.
+ * @returns segments with {type: 'text'|'code', content: string}
+ */
+function splitByCodeBlocks(text) {
+  const segments = []
+  // Match fenced code blocks and inline code
+  const regex = /(```[\s\S]*?```|~~~[\s\S]*?~~~|`[^`\n]+`)/g
+  let lastIndex = 0
+  let match
+  
+  while ((match = regex.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      segments.push({ type: 'text', content: text.substring(lastIndex, match.index) })
+    }
+    segments.push({ type: 'code', content: match[0] })
+    lastIndex = match.index + match[0].length
+  }
+  if (lastIndex < text.length) {
+    segments.push({ type: 'text', content: text.substring(lastIndex) })
+  }
+  if (segments.length === 0) {
+    segments.push({ type: 'text', content: text })
+  }
+  return segments
+}
+
+/**
+ * Translate text using segment translation approach.
+ * Code blocks are preserved as-is, only text segments are translated.
+ */
+async function translateBySegments(text, translateFn) {
+  const segments = splitByCodeBlocks(text)
+  if (segments.length === 1 && segments[0].type === 'text') {
+    return translateFn(text)
+  }
+  for (const seg of segments) {
+    if (seg.type === 'text' && seg.content.trim() !== '') {
+      seg.content = await translateFn(seg.content)
+    }
+  }
+  return segments.map(s => s.content).join('')
+}
+
 
 /** Replace each `[[⟪n⟫]]` placeholder in `translated` with the matching
  * saved code span (by index). Any placeholder the translation dropped is
@@ -1122,6 +1013,54 @@ function extractNouns(text) {
 
   return { stripped, spans }
 }
+/**
+ * Split text by code blocks (inline and fenced) for segment translation.
+ * Code blocks are kept as-is (not translated), only text segments are translated.
+ * This avoids placeholder issues entirely.
+ *
+ * @param text - raw block text possibly containing code.
+ * @returns segments with {type: 'text'|'code', content: string}
+ */
+function splitByCodeBlocks(text) {
+  const segments = []
+  // Match fenced code blocks and inline code
+  const regex = /(```[\s\S]*?```|~~~[\s\S]*?~~~|`[^`\n]+`)/g
+  let lastIndex = 0
+  let match
+  
+  while ((match = regex.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      segments.push({ type: 'text', content: text.substring(lastIndex, match.index) })
+    }
+    segments.push({ type: 'code', content: match[0] })
+    lastIndex = match.index + match[0].length
+  }
+  if (lastIndex < text.length) {
+    segments.push({ type: 'text', content: text.substring(lastIndex) })
+  }
+  if (segments.length === 0) {
+    segments.push({ type: 'text', content: text })
+  }
+  return segments
+}
+
+/**
+ * Translate text using segment translation approach.
+ * Code blocks are preserved as-is, only text segments are translated.
+ */
+async function translateBySegments(text, translateFn) {
+  const segments = splitByCodeBlocks(text)
+  if (segments.length === 1 && segments[0].type === 'text') {
+    return translateFn(text)
+  }
+  for (const seg of segments) {
+    if (seg.type === 'text' && seg.content.trim() !== '') {
+      seg.content = await translateFn(seg.content)
+    }
+  }
+  return segments.map(s => s.content).join('')
+}
+
 
 /** Replace each `[[⟪*n⟫]]` placeholder in `translated` with the matching
  * saved noun span (by index). Any placeholder the translation dropped is
@@ -2732,10 +2671,10 @@ function snapshot(config) {
     timeoutMs: config.timeoutMs.get(),
     maxTextChars: config.maxTextChars.get(),
     offlinePair: config.offlinePair.get(),
-    offlineModelDir: config.offlineModelDir.get(),
+    
     offlineThreads: config.offlineThreads.get(),
     offlineBeamSize: config.offlineBeamSize.get(),
-    offlineAutoDownload: config.offlineAutoDownload.get(),
+    
   }
 }
 
@@ -2762,26 +2701,26 @@ function writeVolatile(field, value) {
 }
 
 /** Trigger a model download. Called on plugin startup and on volatile-update
- *  events when the client sets `offlinePrefetchModel`. */
+ */
 function doPrefetch(ctx, config, pair) {
   if (!pair) return
   logEvent('prefetch-start', { pair })
   const prefetchConfig = {
-    offlineModelDir: config.offlineModelDir.get() || '',
-    offlineAutoDownload: true,
-    offlineModelSources: config.offlineModelSources.get() || [],
-    downloadProgress: {
-      set: (v) => { writeVolatile(config.downloadProgress, v) },
+    
+    
+    
+    
+    
     },
   }
   ensureModel(pair, prefetchConfig).then(() => {
     logEvent('prefetch-complete', { pair })
-    writeVolatile(config.offlinePrefetchModel, '')
-    writeVolatile(config.downloadProgress, '')
+    // Prefetch removed
+    // Progress tracking removed
   }).catch((e) => {
     logEvent('prefetch-failed', { pair, error: e.message })
-    writeVolatile(config.offlinePrefetchModel, '')
-    writeVolatile(config.downloadProgress, '')
+    // Prefetch removed
+    // Progress tracking removed
   })
 }
 
@@ -2807,27 +2746,13 @@ export function apply(ctx, config) {
     offlinePair: cfg0.offlinePair,
     offlineThreads: cfg0.offlineThreads,
     offlineBeamSize: cfg0.offlineBeamSize,
-    offlineAutoDownload: cfg0.offlineAutoDownload,
-    offlineModels: listOfflineModels(cfg0.offlineModelDir),
+    
+    
   })
 
-  // Prefetch model if requested at startup.
-  const prefetchModel = config.offlinePrefetchModel.get()
-  if (prefetchModel) {
-    doPrefetch(ctx, config, prefetchModel)
-  }
 
-  // Listen for volatile-update events so the client can trigger a prefetch
-  // without restarting the plugin. The Loader emits 'loader/volatile-update'
-  // when a volatile field changes at runtime.
-  ctx.on('loader/volatile-update', (paths) => {
-    for (const p of paths) {
-      if (p.length === 1 && p[0] === 'offlinePrefetchModel') {
-        const pair = config.offlinePrefetchModel.get()
-        if (pair) doPrefetch(ctx, config, pair)
-      }
-    }
-  })
+
+
 
   // Re-entrancy guard: skip ONLY the llm/stream call this plugin itself issues
   // (translateWithLlm -> prepared.stream -> llm/stream), detected via the
