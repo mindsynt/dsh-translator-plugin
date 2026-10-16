@@ -581,9 +581,9 @@ export async function translateOffline(text, pair, config, signal, targetLanguag
       if (part.placeholder) out.push(part.placeholder)
       else {
         const r = results[ri++]
-        // NLLB appends a trailing <unk> token; strip it for clean output.
+        // NLLB appends <unk> tokens throughout output; strip all of them.
         let t = typeof r === 'object' && r !== null && typeof r.text === 'string' ? r.text : String(r ?? '')
-        if (isNllb && t.endsWith('<unk>')) t = t.slice(0, -5)
+        if (isNllb) t = t.replace(/<unk>/g, '')
         out.push(t)
       }
     }
