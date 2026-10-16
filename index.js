@@ -1128,22 +1128,24 @@ function extractNouns(text) {
  * re-added by appending its span at the end so nouns are never lost; any
  * placeholder the translation left through is removed defensively. */
 function reinsertNouns(translated, spans) {
-  if (spans.length === 0) return translated
   let result = translated
   const used = []
-  for (let i = 0; i < spans.length; i++) {
-    const placeholder = `[[⟪*${i}⟫]]`
-    if (result.includes(placeholder)) {
-      result = result.split(placeholder).join(spans[i])
-      used[i] = true
+  if (spans.length > 0) {
+    for (let i = 0; i < spans.length; i++) {
+      const placeholder = `[[⟪*${i}⟫]]`
+      if (result.includes(placeholder)) {
+        result = result.split(placeholder).join(spans[i])
+        used[i] = true
+      }
     }
-  }
-  let tail = ''
-  for (let i = 0; i < spans.length; i++) {
-    if (!used[i]) tail += spans[i]
+    let tail = ''
+    for (let i = 0; i < spans.length; i++) {
+      if (!used[i]) tail += spans[i]
+    }
+    result += tail
   }
   result = result.replace(/\[\[⟪\*\d+⟫\]\]/g, '')
-  return result + tail
+  return result
 }
 
 /**
