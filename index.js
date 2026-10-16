@@ -122,6 +122,7 @@ function nllbLangCode(tag) {
   // Use Hans (simplified) for zh by default; switch to Hant if the tag says so
   if (code === 'zh') {
     return /hant|hk|tw/i.test(tag) ? 'zho_Hant' : 'zho_Hans'
+  }
 
   const MAP = {
     en: 'eng_Latn', fr: 'fra_Latn', de: 'deu_Latn', es: 'spa_Latn',
@@ -2568,30 +2569,6 @@ function writeVolatile(field, value) {
   if (field && typeof field[_VOLATILE_WRITE] === 'function') {
     try { field[_VOLATILE_WRITE](value) } catch { /* best effort */ }
   }
-}
-
-/** Trigger a model download. Called on plugin startup and on volatile-update
- */
-function doPrefetch(ctx, config, pair) {
-  if (!pair) return
-  logEvent('prefetch-start', { pair })
-  const prefetchConfig = {
-    
-    
-    
-    
-    
-    },
-  }
-  ensureModel(pair, prefetchConfig).then(() => {
-    logEvent('prefetch-complete', { pair })
-    // Prefetch removed
-    // Progress tracking removed
-  }).catch((e) => {
-    logEvent('prefetch-failed', { pair, error: e.message })
-    // Prefetch removed
-    // Progress tracking removed
-  })
 }
 
 export function apply(ctx, config) {
