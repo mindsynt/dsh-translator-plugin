@@ -297,10 +297,6 @@ window.__ModuleLoader__.load({
       const [timeoutMs,     setTimeoutMs]     = useState(value.timeoutMs     ?? 10000);
       const [maxTextChars,  setMaxTextChars]  = useState(value.maxTextChars  ?? 4000);
       const [offlinePair,   setOfflinePair]   = useState(value.offlinePair   ?? 'auto');
-      const [offlineAutoDownload, setOfflineAutoDownload] = useState(value.offlineAutoDownload ?? false);
-      const [offlineModelSources, setOfflineModelSources] = useState(value.offlineModelSources ?? []);
-      const [offlineModelDir, setOfflineModelDir] = useState(value.offlineModelDir ?? '');
-      const [offlinePrefetchModel, setOfflinePrefetchModel] = useState(value.offlinePrefetchModel ?? '');
       const [prefetching, setPrefetching] = useState(false);
       const [downloadProgress, setDownloadProgress] = useState(null);
       const [offlinePairs,  setOfflinePairs]  = useState([]);
@@ -317,8 +313,7 @@ window.__ModuleLoader__.load({
       useEffect(() => {
         const v = snapshot.value ?? {};
         const sig = [v.provider, v.model, v.targetLanguage, v.translateOutput, v.translateThinking,
-          v.translateMode, v.timeoutMs, v.maxTextChars, v.offlinePair, v.offlineAutoDownload,
-          v.offlineModelSources?.join(','), v.offlineModelDir, v.offlinePrefetchModel].join('\u0001');
+          v.translateMode, v.timeoutMs, v.maxTextChars, v.offlinePair].join('\u0001');
         if (sig === lastSig.current) return;
         lastSig.current = sig;
         setProvider(v.provider ?? 'auto');
@@ -330,10 +325,6 @@ window.__ModuleLoader__.load({
         setTimeoutMs(v.timeoutMs ?? 10000);
         setMaxTextChars(v.maxTextChars ?? 4000);
         setOfflinePair(v.offlinePair ?? 'auto');
-        setOfflineAutoDownload(v.offlineAutoDownload ?? false);
-        setOfflineModelSources(v.offlineModelSources ?? []);
-        setOfflineModelDir(v.offlineModelDir ?? '');
-        setOfflinePrefetchModel(v.offlinePrefetchModel ?? '');
         setError(null);
       }, [snapshot.value]);
 
@@ -385,10 +376,6 @@ window.__ModuleLoader__.load({
             { op: 'set', path: ['timeoutMs'],       value: timeout },
             { op: 'set', path: ['maxTextChars'],    value: maxChars },
             { op: 'set', path: ['offlinePair'],     value: offlinePair },
-            { op: 'set', path: ['offlineAutoDownload'], value: offlineAutoDownload },
-            { op: 'set', path: ['offlineModelSources'], value: offlineModelSources },
-            { op: 'set', path: ['offlineModelDir'], value: offlineModelDir },
-            { op: 'set', path: ['offlinePrefetchModel'], value: offlinePrefetchModel },
           ];
           if (isModelMode) ops.push({ op: 'set', path: ['model'], value: model });
 
@@ -475,65 +462,6 @@ window.__ModuleLoader__.load({
         /* ── Offline engine (only in 'opus' mode) ── */
         isOfflineMode ? h('div', { style: { display: 'flex', flexDirection: 'column', gap: '6px' } },
           h('p', { style: { margin: 0, fontWeight: 600, fontSize: '12px', color: '#888' } }, t('offline')),
-          h('div', { style: { ...S.input, display: 'flex', alignItems: 'center', gap: '8px', color: '#555' } },
-            h('label', { style: S.check, margin: 0 },
-              h('input', {
-                type: 'checkbox',
-                checked: offlineAutoDownload,
-                onChange: (e) => { setOfflineAutoDownload(e.target.checked); setSaved(false); },
-                disabled,
-              }),
-              h('span', {}, t('offlineAutoDownload')),
-            ),
-          ),
-          h('p', { style: S.desc }, t('offlineAutoDownloadHint')),
-          h('label', { style: S.label }, t('offlineModelSources')),
-          h('select', {
-            value: (() => {
-              if (offlineModelSources.length === 0) return 'default';
-              if (offlineModelSources.length === 1 && offlineModelSources[0] === 'custom') return 'custom';
-              const urlToPreset = {
-                'https://huggingface.co': 'huggingface',
-                'https://hf-mirror.com': 'hf-mirror',
-                'https://modelscope.cn/models': 'modelscope',
-                'https://openxlab.org.cn/models': 'openxlab',
-              };
-              return urlToPreset[offlineModelSources[0]] || 'custom';
-            })(),
-            onChange: (e) => {
-              const val = e.target.value;
-              let sources = [];
-              if (val === 'default') {
-                sources = [];
-              } else if (val === 'huggingface') {
-                sources = ['https://huggingface.co'];
-              } else if (val === 'hf-mirror') {
-                sources = ['https://hf-mirror.com'];
-              } else if (val === 'modelscope') {
-                sources = ['https://modelscope.cn/models'];
-              } else if (val === 'openxlab') {
-                sources = ['https://openxlab.org.cn/models'];
-              }
-              setOfflineModelSources(sources);
-              setSaved(false);
-            },
-            disabled,
-            style: S.input,
-          },
-            MODEL_SOURCE_PRESETS.map((v) => h('option', { key: v, value: v }, modelSourceLabel(t, v))),
-          ),
-          h('p', { style: S.desc }, t('offlineModelSourcesHint')),
-          /* ── Model directory ── */
-          h('label', { style: S.label }, t('offlineModelDir')),
-          h('input', {
-            type: 'text',
-            value: offlineModelDir,
-            onChange: (e) => { setOfflineModelDir(e.target.value); setSaved(false); },
-            disabled,
-            placeholder: '~/.dsh/model-translator/models/',
-            style: { ...S.input, fontFamily: 'monospace', fontSize: '12px' },
-          }),
-          h('p', { style: S.desc }, t('offlineModelDirHint')),
           h('label', { style: S.label }, t('offlinePair')),
           h('select', {
             value: offlinePair,
@@ -544,73 +472,6 @@ window.__ModuleLoader__.load({
             OFFLINE_PAIR_VALUES.map((v) => h('option', { key: v, value: v }, offlinePairLabel(t, v))),
           ),
           h('p', { style: S.desc }, t('offlinePairHint')),
-          /* ── Prefetch model ── */
-          h('label', { style: S.label }, t('offlinePrefetch')),
-          h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center' } },
-            h('select', {
-              value: offlinePrefetchModel,
-              onChange: (e) => { setOfflinePrefetchModel(e.target.value); setSaved(false); },
-              disabled: prefetching || disabled,
-              style: { ...S.input, flex: 1 },
-            },
-              [h('option', { key: '', value: '' }, t('prefetchNone'))]
-                .concat(OFFLINE_PAIR_VALUES.filter(v => v !== 'auto').map(v => 
-                  h('option', { key: v, value: v }, offlinePairLabel(t, v))
-                )),
-            ),
-            h('button', {
-              type: 'button',
-              onClick: async () => {
-                if (!offlinePrefetchModel) { setError(t('prefetchSelectModel')); return; }
-                setPrefetching(true);
-                try {
-                  const ok = await form.mutate([{ op: 'set', path: ['offlinePrefetchModel'], value: offlinePrefetchModel }]);
-                  if (ok) setSaved(true);
-                  else setError(t('saveFailed'));
-                } catch (e) {
-                  setError(e.message || t('saveFailedGeneric'));
-                } finally {
-                  setPrefetching(false);
-                }
-              },
-              disabled: !offlinePrefetchModel || prefetching || disabled,
-              style: { ...S.btn, whiteSpace: 'nowrap' },
-          }, prefetching ? t('prefetchDownloading') : t('prefetchDownload')),
-          ),
-          /* download progress display */
-          downloadProgress ? h('div', {
-            style: {
-              marginTop: '8px',
-              padding: '8px 12px',
-              borderRadius: '6px',
-              backgroundColor: downloadProgress.status === 'complete' ? '#e8f5e9' :
-                downloadProgress.status === 'failed' ? '#ffebee' : '#e3f2fd',
-              border: '1px solid ' + (
-                downloadProgress.status === 'complete' ? '#4caf50' :
-                downloadProgress.status === 'failed' ? '#f44336' : '#2196f3'
-              ),
-              fontSize: '12px',
-              lineHeight: '1.5',
-            },
-          },
-            downloadProgress.status === 'downloading' ? [
-              h('div', { key: 'title', style: { fontWeight: 'bold', marginBottom: '4px' } },
-                t('progressDownloading') + ' ' + (downloadProgress.pair || '')),
-              h('div', { key: 'file', style: { color: '#555' } },
-                t('progressFile') + ' ' + downloadProgress.fileIndex + t('progressOf') +
-                ' ' + downloadProgress.totalFiles + ': ' + (downloadProgress.file || '')),
-              downloadProgress.source ? h('div', { key: 'src', style: { color: '#888', fontSize: '11px' } },
-                'from ' + downloadProgress.source) : null,
-            ] : downloadProgress.status === 'complete' ? [
-              h('div', { key: 'done', style: { fontWeight: 'bold', color: '#2e7d32' } },
-                t('progressComplete') + ' ' + (downloadProgress.pair || '')),
-              downloadProgress.dir ? h('div', { key: 'dir', style: { color: '#555', fontFamily: 'monospace', fontSize: '11px', marginTop: '4px' } },
-                downloadProgress.dir) : null,
-            ] : downloadProgress.status === 'failed' ? h('div', {
-              key: 'fail', style: { fontWeight: 'bold', color: '#c62828' },
-            }, t('progressFailed') + ' ' + (downloadProgress.pair || '') + ': ' + (downloadProgress.error || '')) : null
-          ) : null,
-          h('p', { style: S.desc }, t('offlinePrefetchHint')),
           h('p', { style: S.desc }, t('offlineNote')),
         ) : null,
 
