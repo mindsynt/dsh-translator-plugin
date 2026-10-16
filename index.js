@@ -891,29 +891,28 @@ function extractCode(text) {
  * re-added by appending its span at the end so code is never lost; any
  * placeholder the translation left through is removed defensively. */
 function reinsertCode(translated, spans) {
-  if (spans.length === 0) return translated
   let result = translated
   const used = []
-  for (let i = 0; i < spans.length; i++) {
-    // Check both plain [[⟪n⟫]] and starred [[⟪*n⟫]] placeholders
-    const placeholder = `[[⟪${i}⟫]]`
-    const starredPlaceholder = `[[⟪*${i}⟫]]`
-    if (result.includes(placeholder)) {
-      result = result.split(placeholder).join(spans[i])
-      used[i] = true
-    } else if (result.includes(starredPlaceholder)) {
-      result = result.split(starredPlaceholder).join(spans[i])
-      used[i] = true
+  if (spans.length > 0) {
+    for (let i = 0; i < spans.length; i++) {
+      const placeholder = `[[⟪${i}⟫]]`
+      const starredPlaceholder = `[[⟪*${i}⟫]]`
+      if (result.includes(placeholder)) {
+        result = result.split(placeholder).join(spans[i])
+        used[i] = true
+      } else if (result.includes(starredPlaceholder)) {
+        result = result.split(starredPlaceholder).join(spans[i])
+        used[i] = true
+      }
     }
+    let tail = ''
+    for (let i = 0; i < spans.length; i++) {
+      if (!used[i]) tail += spans[i]
+    }
+    result += tail
   }
-  // Append code spans whose placeholder the translation dropped/reordered away.
-  let tail = ''
-  for (let i = 0; i < spans.length; i++) {
-    if (!used[i]) tail += spans[i]
-  }
-  // Remove any placeholder text that survived (defensive) before appending.
   result = result.replace(/\[\[⟪\*?\d+⟫\]\]/g, '')
-  return result + tail
+  return result
 }
 
 /** Split `text` into chunks of at most `chunkSize` characters, preferring to
