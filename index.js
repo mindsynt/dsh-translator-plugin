@@ -1114,8 +1114,17 @@ function reportFailure(what, error, startedAt, facts) {
  *  - Excessive special characters (>30% non-printable)
  *  - Output much longer than source (>3x with no reason)
  */
+/** Strip code blocks and inline code from text. Used before isGarbled so
+ *  that preserved code segments (which contain legitimate symbol runs like
+ *  git diffs, markdown, and backtick-quoted examples) don't trip the
+ *  repeated-character rules. */
+function stripCodeSegments(text) {
+  const segments = splitByCodeBlocks(text)
+  return segments.filter(s => s.type === 'text').map(s => s.content).join('')
+}
+
 function isGarbled(source, target) {
-  if (!target || target.length === 0) return true
+  if (!target || target.length === 0) return source.length > 0
   if (source.length === 0) return false
 
   // 1. Repeated single character runs (3+ same chars). Opus pads garbage with
@@ -2091,8 +2100,9 @@ async function translateSentence(text, config, signal, llm, currentModel, langua
     return text
   }
 
-  // Garbled detection
-  if (isGarbled(text, translated)) {
+  // Garbled detection — strip code segments first so preserved code
+  // (git diffs, markdown, backtick-quoted examples) doesn't trip rule 1.
+  if (isGarbled(stripCodeSegments(text), stripCodeSegments(translated))) {
     logEvent('garbled-fallback', {
       source: text.slice(0, 100),
       target: translated.slice(0, 100),
@@ -2477,8 +2487,9 @@ async function* translateStream(original, config, signal, llm, currentModel) {
             }
           }
 
-          // Garbled detection
-          if (isGarbled(fullText, translated)) {
+          // Garbled detection — strip code segments first so preserved code
+          // (git diffs, markdown, backtick-quoted examples) doesn't trip rule 1.
+          if (isGarbled(stripCodeSegments(fullText), stripCodeSegments(translated))) {
             logEvent('garbled-fallback', {
               what: `block ${chunk.index} (${blockType || 'unknown'})`,
               source: fullText.slice(0, 100),
