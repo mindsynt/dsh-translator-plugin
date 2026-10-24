@@ -98,7 +98,8 @@ per provider — `zh-Hans` / `zh-Hant` for Bing, `zh-CN` / `zh-TW` for Google.
 - **Every decision is logged to a file.** All events — `boot`, `capability`
   (the route's advertised effort vocabulary), `hook`,
   `translated`, `skip` (`short-block`, `streamed-live`,
-  `already-target-language`, `cache-hit`), `fallback` and `fail` — are appended
+  `already-target-language`, `cache-hit`), `fallback`, `fail`,
+  `session-records` and `session-record-fail` — are appended
   as JSONL to `$DSH_HOME/logs/model-translator.log` (falling back to
   `~/.dsh/logs/` — the host does not export `DSH_HOME` — and finally to
   `$TMPDIR/logs/`). The host's `console.error` goes to whatever terminal
@@ -107,6 +108,21 @@ per provider — `zh-Hans` / `zh-Hant` for Bing, `zh-CN` / `zh-TW` for Google.
   `boot` line means `apply()` never ran (the module failed to load, or the
   bundle is disabled); a `boot` line with no `hook` line means the hook was
   registered but never called. Logging never throws into translation.
+- **Every translation call is recorded in the session log.** Each text sent to
+  a translation engine is appended to the conversation's own session log as a
+  `plugin:model-translator/request` + `plugin:model-translator/result` record
+  pair — the harness's "model-visible ⟺ recorded" invariant — which also
+  makes the translation cache durable: after a restart, the same text is
+  served from the session records instead of being translated again. Records
+  live in the plugin's own `plugin:` namespace, never enter the model-visible
+  surface, and are best-effort: if the session packages cannot be imported or
+  the stream carries no session id, translation proceeds with the in-memory
+  cache alone. The identity covers provider, model, exact text, both
+  languages and a recipe revision, so a prompt change starts a fresh cache.
+- **Translation calls are marked auxiliary.** Model-route translation requests
+  carry `purpose: 'translation'`, the same mechanism `session-title` and
+  compaction use, so pipeline observers can tell an auxiliary call from a
+  conversation turn.
 - **No translation recursion.** The re-entrancy guard targets only the
   `llm/stream` call this plugin itself issues (detected via an async-local
   store), so translation never translates itself — and never suppresses a
@@ -249,11 +265,21 @@ entirely.
   响应才会让翻译失败。
 - **每个决策都落盘。** 所有事件 —— `boot`、`capability`（该路由声明的 effort 词汇表）、`hook`、`translated`、`skip`
   （`short-block` / `streamed-live` / `already-target-language` / `cache-hit`）、
-  `fallback`、`fail` —— 都以 JSONL 追加到 `$DSH_HOME/logs/model-translator.log`
+  `fallback`、`fail`、`session-records`、`session-record-fail` —— 都以 JSONL 追加到 `$DSH_HOME/logs/model-translator.log`
   （回退到 `~/.dsh/logs/` —— host 并没有导出 `DSH_HOME` —— 最后回退到 `$TMPDIR/logs/`）。host 的 `console.error` 只会写进启动它的那个终端，
   往往是没人读得到的伪终端；文件跨重启保留，且进程内任何人均可读。没有 `boot`
   行说明 `apply()` 从未执行（模块加载失败或 bundle 被禁用）；有 `boot` 但没有
   `hook` 说明 hook 注册了却从未被调用。写日志绝不打断翻译。
+- **每次翻译调用都记录进会话日志。** 发给翻译引擎的每段文本都会以
+  `plugin:model-translator/request` + `plugin:model-translator/result`
+  记录对的形式追加到该对话自己的会话日志 —— 即 harness 的
+  「模型可见 ⟺ 已记录」不变量 —— 同时这也让翻译缓存获得持久形态：重启之后同样的
+  文本直接从会话记录中复用，不再重新翻译。记录使用插件自己的 `plugin:` 命名空间，
+  永不进入模型可见面；且为尽力而为 —— 会话包无法导入或流上没有 sessionId 时，
+  翻照常进行，只是退回内存缓存。缓存身份覆盖 provider、模型、精确原文、两种语言
+  和配方修订号，因此提示词一变，缓存即从零开始。
+- **翻译调用带辅助标识。** 模型路由的翻译请求携带 `purpose: 'translation'` ——
+  与 `session-title`、压缩相同的机制 —— 让管道观察者能把它和对话轮次区分开。
 - **没有翻译递归。** 重入守卫只针对插件自己发起的那次 `llm/stream` 调用（用
   async-local 存储识别），因此翻译不会去翻译翻译本身——也不会误杀并发的真实流。
 - **并发流是安全的。** 守卫是按调用而非进程级开关，因此同时运行的 teammate、

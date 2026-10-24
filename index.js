@@ -12,7 +12,6 @@ import { fileURLToPath } from 'node:url'
 
 const BING_ENDPOINT = 'https://edge.microsoft.com/translate/translatetext'
 const GOOGLE_ENDPOINT = 'https://translate.googleapis.com/translate_a/single'
-const DEFAULT_MODEL = 'deepseek-flash'
 
 /* ────────────────────────────────────────────────────────────────────────────
  * Offline engine: CTranslate2 + Opus-MT
@@ -307,22 +306,17 @@ async function ensureModel(pair, config) {
     'Place model files in ' + dir)
 }
 
-/** LRU of loaded translators by model directory. Holding them open is the
- *  whole point of the offline engine: the ~5 s model-load cost is paid once
- *  and then every block is a few hundred milliseconds of pure inference. */
-const ct2Translators = new Map()
-
 /** Lazily load the native addon once. Fails once and stays failed, so an
- *  unsupported platform does not pay an import cost on every block. */
-let ct2Loader = null
-async function loadCt2() {
-  if (ct2Loader === null) {
-    ct2Loader = import('ctranslate2').catch((e) => {
+ *  unsupported platform does not pay an import cost on every block. The
+ *  promise (or the failure) lives in the plugin state's `offline.loader`. */
+async function loadCt2(state) {
+  if (state.offline.loader === null) {
+    state.offline.loader = import('ctranslate2').catch((e) => {
       throw new Error(
         `the offline engine is unavailable on this platform: ${e && e.message ? e.message : e}`)
     })
   }
-  return ct2Loader
+  return state.offline.loader
 }
 
 /** Assemble model.bin from split parts (model-part-aa, model-part-ab, …).
@@ -360,18 +354,21 @@ async function assembleModelBin(dir) {
 
 /** Load (or reuse) the translator for a model directory. A translator that
  *  fails to load is recorded on disk so later calls fail fast rather than
- *  re-trying a bad model.bin every stream. */
-async function translatorFor(pair, config) {
+ *  re-trying a bad model.bin every stream. Loaded translators are held open
+ *  in the plugin state — that is the whole point of the offline engine: the
+ *  ~5 s model-load cost is paid once and then every block is a few hundred
+ *  milliseconds of pure inference. */
+async function translatorFor(state, pair, config) {
   const dir = await ensureModel(pair, config)
   await assembleModelBin(dir)
-  if (ct2Translators.has(dir)) return ct2Translators.get(dir)
-  const ct2 = await loadCt2()
+  if (state.offline.translators.has(dir)) return state.offline.translators.get(dir)
+  const ct2 = await loadCt2(state)
   const t = new ct2.Ct2Translator({
     modelPath: dir,
     device: 'cpu',
     threads: config.offlineThreads,
   })
-  ct2Translators.set(dir, t)
+  state.offline.translators.set(dir, t)
   logEvent('offline-loaded', { pair, dir, threads: config.offlineThreads })
   return t
 }
@@ -393,9 +390,11 @@ function splitAroundPlaceholders(text) {
 /** Load (or reuse) the translator for a pair, returning it alongside the
  *  directory it was loaded from. The directory rides along so failures can be
  *  logged with exactly which files were read. */
-async function loadOffline(pair, config) {
+async function loadOffline(state, pair, config) {
   const dir = await ensureModel(pair, config)
-  const translator = ct2Translators.has(dir) ? ct2Translators.get(dir) : await translatorFor(pair, config)
+  const translator = state.offline.translators.has(dir)
+    ? state.offline.translators.get(dir)
+    : await translatorFor(state, pair, config)
   return { translator, dir }
 }
 
@@ -405,7 +404,7 @@ async function loadOffline(pair, config) {
  *  (flush the original block verbatim) applies, so a broken offline engine can
  *  never break a stream — but it also cannot silently degrade: every failure
  *  is logged with the pair, the model directory, and the elapsed time. */
-export async function translateOffline(text, pair, config, signal, targetLanguage) {
+export async function translateOffline(text, pair, config, signal, targetLanguage, state) {
   if (text === '') return ''
   if (signal && signal.aborted) throw new Error('translation aborted')
 
@@ -413,7 +412,7 @@ export async function translateOffline(text, pair, config, signal, targetLanguag
   let translator
   let dir = ''
   try {
-    const loaded = await loadOffline(pair, config)
+    const loaded = await loadOffline(state, pair, config)
     translator = loaded.translator
     dir = loaded.dir
   } catch (e) {
@@ -871,17 +870,12 @@ const PROPER_NOUNS = [
   'GitHub', 'npm', 'pip', 'brew', 'Homebrew',
 ]
 
-/** Translation result cache keyed by MD5(source + target + mode).
- *  LRU-evicted when the cache exceeds CACHE_MAX. */
-const translationCache = new Map()
-
-/** Glossary of source→translated term pairs, most recent first.
- *  Populated after each successful model translation by extracting
- *  English words that survived translation unchanged (indicating they
- *  are proper nouns or technical terms the model chose to keep).
- *  Injected into the next translation's system prompt so terminology
- *  stays consistent across a conversation. */
-const glossary = []
+/** Translation result cache keyed by MD5(source + target + mode),
+ *  LRU-evicted when the cache exceeds CACHE_MAX, and a glossary of
+ *  source→translated term pairs (most recent first) populated after each
+ *  successful model translation. Both live in the plugin state created by
+ *  {@link createState} — never at module level, so a hot reload starts clean
+ *  and no state is shared across plugin instances. */
 
 /**
  * Extract English proper nouns / CamelCase words from `text`, replacing
@@ -1687,23 +1681,185 @@ function hashKey(text, targetLanguage, provider) {
 }
 
 /** Cache lookup: returns the cached translation or undefined. */
-function cacheGet(key) {
-  const hit = translationCache.get(key)
+/** Cache lookup with LRU touch. */
+function cacheGet(state, key) {
+  const hit = state.cache.get(key)
   if (hit !== undefined) {
     // Move to end (most recently used).
-    translationCache.delete(key)
-    translationCache.set(key, hit)
+    state.cache.delete(key)
+    state.cache.set(key, hit)
   }
   return hit
 }
 
 /** Cache store with LRU eviction. */
-function cacheSet(key, value) {
-  translationCache.set(key, value)
-  if (translationCache.size > CACHE_MAX) {
+function cacheSet(state, key, value) {
+  state.cache.set(key, value)
+  if (state.cache.size > CACHE_MAX) {
     // Evict the oldest entry (first key in insertion order).
-    const oldest = translationCache.keys().next().value
-    if (oldest !== undefined) translationCache.delete(oldest)
+    const oldest = state.cache.keys().next().value
+    if (oldest !== undefined) state.cache.delete(oldest)
+  }
+}
+
+// ─── Session-backed translation records ─────────────────────────────────────
+//
+// Two jobs, one mechanism: every text this plugin sends to a translation
+// engine is appended to the conversation's own session log as a
+// request/result record pair, and those records double as a durable cache —
+// after a restart the same call is reused instead of re-translated.
+//
+// Compliance: an input that reaches a model must be reconstructable from the
+// session log ("model-visible ⟺ recorded"). The plugin's translation calls
+// are auxiliary model calls, so each one is recorded here, in the session the
+// stream belongs to. Records use this plugin's own `plugin:model-translator/*`
+// namespace; a reader that does not know the type retains and skips them, and
+// they never enter the model-visible surface.
+//
+// The whole feature is best-effort and must never delay or break a
+// translation: if the session packages cannot be imported (unusual install
+// layout) or the stream carries no sessionId, translation proceeds with the
+// in-memory cache alone.
+
+const RECORD_REQUEST_TYPE = 'plugin:model-translator/request'
+const RECORD_RESULT_TYPE = 'plugin:model-translator/result'
+/** Bump when the translation recipe changes (prompt wording, params, pairing
+ *  rules) so results cached under an older recipe are not served again. */
+const RECORD_RECIPE = 1
+
+/** The host's session package, probed once per plugin instance.
+ *  `undefined` = not probed yet, `false` = unavailable, truthy = the module
+ *  ({ appendPluginRecord, pluginRecordOf }). Lives in `state.records.module`. */
+async function loadSessionRecords(state) {
+  if (state.records.module !== undefined) return state.records.module
+  try {
+    state.records.module = await import('@deepseek-ai/dsh-session')
+  } catch (e) {
+    logEvent('session-records', { available: false, reason: 'import-failed', error: String((e && e.message) || e) })
+    state.records.module = false
+  }
+  return state.records.module
+}
+
+/** Everything that determines one engine call's output; the durable cache key
+ *  is the JSON tuple, the stored record is the readable object form. */
+function translationRecord(provider, model, text, sourceLanguage, targetLanguage, recipe) {
+  return { provider, model: model ?? '', text, sourceLanguage, targetLanguage, recipe }
+}
+
+function translationIdentity(record) {
+  return JSON.stringify([record.provider, record.model, record.text, record.sourceLanguage, record.targetLanguage, record.recipe])
+}
+
+/** Durable cache index for one session: { map, read, inflight } where `map`
+ *  holds identity → translated text and `read` is the log length the index
+ *  already covers. Built lazily on the first lookup of the session by
+ *  scanning the persisted log once, then advanced incrementally. A negative
+ *  `read` marks the session as unreadable so lookups stop retrying.
+ *  Indexes live in `state.records.indexes`. */
+const SESSION_INDEX_UNAVAILABLE = -1
+
+async function sessionIndexFor(recorder, sessionId, signal, state) {
+  const existing = state.records.indexes.get(sessionId)
+  if (existing && !existing.inflight) return existing
+  if (existing?.inflight) { await existing.inflight; return state.records.indexes.get(sessionId) }
+  const index = existing ?? { map: null, read: 0, inflight: undefined }
+  state.records.indexes.set(sessionId, index)
+  index.inflight = (async () => {
+    try {
+      const mod = await loadSessionRecords(state)
+      const persistence = mod ? recorder.ctx.get('sessionPersistence') : undefined
+      if (!mod || !persistence || typeof persistence.open !== 'function') {
+        index.read = SESSION_INDEX_UNAVAILABLE
+        return
+      }
+      if (index.map === null) index.map = new Map()
+      if (index.read === SESSION_INDEX_UNAVAILABLE) return
+      if (typeof persistence.stat === 'function'
+        && await persistence.stat(sessionId, { signal }) === undefined) {
+        index.read = SESSION_INDEX_UNAVAILABLE
+        return
+      }
+      const start = Math.max(index.read, 0)
+      const handle = await persistence.open(sessionId, 'read', { signal })
+      try {
+        const stored = await handle.read(start, undefined, { signal })
+        const events = stored?.events ?? []
+        const requests = new Map()
+        for (const event of events) {
+          const record = mod.pluginRecordOf(event)
+          if (!record) continue
+          if (record.type === RECORD_REQUEST_TYPE) {
+            const d = record.data
+            if (d && typeof d === 'object' && typeof d.provider === 'string' && typeof d.text === 'string') {
+              requests.set(record.seq, translationRecord(
+                d.provider, d.model, d.text, d.sourceLanguage, d.targetLanguage, d.recipe))
+            }
+          } else if (record.type === RECORD_RESULT_TYPE) {
+            const d = record.data
+            const request = requests.get(d?.requestSeq)
+            if (request !== undefined && typeof d.text === 'string') {
+              index.map.set(translationIdentity(request), d.text)
+            }
+          }
+        }
+        index.read = start + events.length
+      } finally {
+        try {
+          const dispose = typeof handle[Symbol.asyncDispose] === 'function' ? () => handle[Symbol.asyncDispose]()
+            : typeof handle.close === 'function' ? () => handle.close() : null
+          if (dispose) await dispose()
+        } catch { /* the read itself succeeded; a failed close is harmless */ }
+      }
+    } catch (e) {
+      // An aborted stream must not poison the index — leave it for the next
+      // lookup. Any other failure marks the session unreadable so per-segment
+      // lookups stop paying for a scan that will never succeed.
+      if (!signal?.aborted) {
+        index.read = SESSION_INDEX_UNAVAILABLE
+        logEvent('session-records', {
+          available: false, reason: 'read-failed',
+          sessionId: String(sessionId), error: String((e && e.message) || e),
+        })
+      }
+    } finally {
+      index.inflight = undefined
+    }
+  })()
+  await index.inflight
+  return index
+}
+
+/** Look up one translation in the session's durable record cache. Returns
+ *  undefined on any miss or failure — callers fall through to the engine. */
+async function sessionCacheLookup(recorder, sessionId, record, signal, state) {
+  if (!recorder || sessionId === undefined || signal?.aborted) return undefined
+  const index = await sessionIndexFor(recorder, sessionId, signal, state)
+  return index?.map?.get(translationIdentity(record))
+}
+
+/** Append one request/result pair to the session log and flush. Best-effort:
+ *  every failure is logged and swallowed — a lost record only means the
+ *  translation runs again next time. */
+async function sessionCacheRecord(recorder, sessionId, record, translated, state) {
+  try {
+    if (!recorder || sessionId === undefined) return
+    const mod = await loadSessionRecords(state)
+    if (!mod) return
+    const sessions = recorder.ctx.get('sessions')
+    const session = sessions?.get(sessionId)
+    if (!session) return
+    const requestSeq = mod.appendPluginRecord(session, RECORD_REQUEST_TYPE, record)
+    mod.appendPluginRecord(session, RECORD_RESULT_TYPE, { requestSeq, text: translated })
+    await sessions.flush(session)
+    // Serve future lookups from memory without waiting for a rescan.
+    const index = state.records.indexes.get(sessionId)
+    if (index?.map) index.map.set(translationIdentity(record), translated)
+  } catch (e) {
+    logEvent('session-record-fail', {
+      sessionId: String(sessionId),
+      error: String((e && e.message) || e),
+    })
   }
 }
 
@@ -1753,9 +1909,9 @@ function extractGlossaryTerms(source, translated) {
 
 /** Inject recent glossary terms into the translation glossary, most
  *  recent first, bounded to GLOSSARY_MAX entries. */
-function pushGlossary(terms) {
-  for (const t of terms) glossary.unshift(t)
-  if (glossary.length > GLOSSARY_MAX) glossary.length = GLOSSARY_MAX
+function pushGlossary(state, terms) {
+  for (const t of terms) state.glossary.unshift(t)
+  if (state.glossary.length > GLOSSARY_MAX) state.glossary.length = GLOSSARY_MAX
 }
 
 /** Translate `text` by splitting it into provider-sized segments and
@@ -1837,19 +1993,19 @@ async function translateText(provider, text, targetLanguage, timeoutMs, signal) 
  * registered providers and their advertised models. Used when the user picks a
  * concrete translation model: its owning provider route is looked up so the
  * translation call targets the right adapter instead of the conversation's.
+ * The map and its built-flag live in the plugin state (`state.modelProviders`).
  */
-const modelProviderMap = new Map()
-let modelProviderMapBuilt = false
 
 /**
  * Resolve the provider route that owns `modelId`, or undefined if unknown.
  * @param llm - the LLM runtime service.
  * @param modelId - a concrete model id from dsh's loaded catalog.
+ * @param state - plugin instance state.
  */
-async function providerForModel(llm, modelId) {
+async function providerForModel(llm, modelId, state) {
   if (!modelId || modelId === 'auto') return undefined
-  if (modelProviderMapBuilt) return modelProviderMap.get(modelId)
-  modelProviderMapBuilt = true
+  if (state.modelProviders.built) return state.modelProviders.map.get(modelId)
+  state.modelProviders.built = true
   if (typeof llm?.listProviders !== 'function') return undefined
   try {
     for (const info of llm.listProviders()) {
@@ -1860,13 +2016,13 @@ async function providerForModel(llm, modelId) {
           : []
         for (const m of models ?? []) {
           if (typeof m === 'object' && m !== null && typeof m.id === 'string') {
-            modelProviderMap.set(m.id, provider)
+            state.modelProviders.map.set(m.id, provider)
           }
         }
       } catch { /* provider listing failed; skip */ }
     }
   } catch { /* listProviders failed */ }
-  return modelProviderMap.get(modelId)
+  return state.modelProviders.map.get(modelId)
 }
 
 /**
@@ -1910,7 +2066,14 @@ async function translateWithLlm(llm, provider, model, text, targetLanguage, time
         system += `\n\nKeep these terms exactly as written — they are proper nouns and identifiers the text uses unchanged:\n${glossary.map(g => `- "${g.source}"`).join('\n')}`
       }
       const messages = [{ role: 'user', content: [{ type: 'text', text }] }]
-      const options = { ...prepared.config, system, messages, signal: controller.signal }
+      const options = { ...prepared.config, system, messages, signal: controller.signal,
+        // Mark this as an auxiliary call so llm/stream observers do not mistake
+        // it for a conversation request — the same mechanism session-title
+        // ('session-title') and compaction ('compaction') use. 'translation' is
+        // outside the currently declared union; adapters forward unknown values
+        // as model-hidden transport metadata and today nothing rejects them,
+        // so the marker is informative rather than load-bearing.
+        purpose: 'translation' }
 
       let translated = ''
       for await (const chunk of prepared.stream(options)) {
@@ -2044,7 +2207,7 @@ const SENTENCE_MIN_CHARS = 10
  *  translate → postProcess) but on a single sentence, with caching.
  *  Resolves provider/model the same way as the block-end path.
  *  On failure, falls back to the original text (never breaks the stream). */
-async function translateSentence(text, config, signal, llm, currentModel, language) {
+async function translateSentence(text, config, signal, llm, currentModel, language, recorder, sessionId, state) {
   if (!text || text.trim() === '') return text
 
   // Detect source language on original text (before segment splitting)
@@ -2058,7 +2221,7 @@ async function translateSentence(text, config, signal, llm, currentModel, langua
     provider = mode
     model = config.model
   } else if (mode === 'model') {
-    provider = (await providerForModel(llm, config.model)) ?? currentModel.provider
+    provider = (await providerForModel(llm, config.model, state)) ?? currentModel.provider
     model = config.model === 'auto' ? currentModel.model : config.model
   } else {
     provider = currentModel.provider
@@ -2068,14 +2231,14 @@ async function translateSentence(text, config, signal, llm, currentModel, langua
   // Cache check (key on original text)
   const isFreeEngine = provider === 'bing' || provider === 'google' || provider === 'opus'
   const cacheKey = hashKey(text, language, provider)
-  const cached = cacheGet(cacheKey)
+  const cached = cacheGet(state, cacheKey)
   if (cached !== undefined) {
     return postProcess(cached, null, null, language)
   }
 
   // Build the translate function
-  const glossaryContext = isFreeEngine ? undefined : [...glossary]
-  const translateFn = (seg) => {
+  const glossaryContext = isFreeEngine ? undefined : [...state.glossary]
+  const engineCall = (seg) => {
     if (provider === 'opus') {
       let source = detected || 'en'
       // Mixed-language guard: force en→target if text has Latin-script prose
@@ -2085,11 +2248,29 @@ async function translateSentence(text, config, signal, llm, currentModel, langua
       }
       const { pair } = resolveOfflinePair(source, language, config.offlinePair)
       if (!pair) return Promise.resolve(seg)
-      return translateOffline(seg, pair, config, signal, language)
+      return translateOffline(seg, pair, config, signal, language, state)
     }
     return isFreeEngine
       ? translateText(provider, seg, language, config.timeoutMs, signal)
       : translateWithLlm(llm, provider, model, seg, language, config.timeoutMs, signal, glossaryContext)
+  }
+  // Session-backed durable cache around every engine call — same wrapping as
+  // the block-end path: a hit skips the engine, a miss is recorded.
+  let sessionCacheHits = 0
+  const translateFn = async (seg) => {
+    const recipe = provider === 'opus' ? `opus:${config.offlinePair}:${RECORD_RECIPE}`
+      : isFreeEngine ? `${provider}:${RECORD_RECIPE}`
+      : `llm:${model}:${RECORD_RECIPE}`
+    const record = translationRecord(
+      provider, provider === 'opus' ? '' : model, seg, detected || 'auto', language, recipe)
+    const hit = await sessionCacheLookup(recorder, sessionId, record, signal, state)
+    if (hit !== undefined) {
+      sessionCacheHits++
+      return hit
+    }
+    const translated = await engineCall(seg)
+    await sessionCacheRecord(recorder, sessionId, record, translated, state)
+    return translated
   }
 
   // Translate using segment approach — code blocks are preserved as-is
@@ -2114,7 +2295,7 @@ async function translateSentence(text, config, signal, llm, currentModel, langua
   }
 
   // Cache
-  cacheSet(cacheKey, translated)
+  cacheSet(state, cacheKey, translated)
 
   // Post-process (punctuation localization only)
   const result = postProcess(translated, null, null, language)
@@ -2126,7 +2307,7 @@ async function translateSentence(text, config, signal, llm, currentModel, langua
     source: text.slice(0, 200),
     target: result.slice(0, 200),
     detected, language, provider,
-    hadCode,
+    hadCode, sessionCacheHits,
   })
 
   return result
@@ -2166,7 +2347,7 @@ async function translateSentence(text, config, signal, llm, currentModel, langua
  * catalog) uses that one. bing/google are free translation engines (model is
  * ignored for them).
  */
-async function* translateStream(original, config, signal, llm, currentModel) {
+async function* translateStream(original, config, signal, llm, currentModel, recorder, sessionId, state) {
   // Per-block buffers for blocks we will translate or may still translate.
   // The `passthrough` set holds indices whose deltas stream live and that
   // have never been pulled back into buffering.
@@ -2264,7 +2445,7 @@ async function* translateStream(original, config, signal, llm, currentModel) {
 
               // Translate and yield as a synthetic delta.
               const translated = await translateSentence(
-                sentence, config, signal, llm, currentModel, language)
+                sentence, config, signal, llm, currentModel, language, recorder, sessionId, state)
               yield { type: chunk.type, index: chunk.index, text: translated }
 
               // Track translated parts for block-end text rebuild.
@@ -2356,7 +2537,7 @@ async function* translateStream(original, config, signal, llm, currentModel) {
           let remainingTranslated = ''
           if (entry.text.trim()) {
             remainingTranslated = await translateSentence(
-              entry.text, config, signal, llm, currentModel, language)
+              entry.text, config, signal, llm, currentModel, language, recorder, sessionId, state)
           }
           const finalText = entry.translatedParts.join('') +
             (entry.yieldedText || '') + remainingTranslated
@@ -2404,7 +2585,7 @@ async function* translateStream(original, config, signal, llm, currentModel) {
             provider = mode
             model = config.model
           } else if (mode === 'model') {
-            provider = (await providerForModel(llm, config.model)) ?? currentModel.provider
+            provider = (await providerForModel(llm, config.model, state)) ?? currentModel.provider
             model = config.model === 'auto' ? currentModel.model : config.model
           } else {
             provider = currentModel.provider
@@ -2434,7 +2615,7 @@ async function* translateStream(original, config, signal, llm, currentModel) {
           // Cache check
           const isFreeEngine = provider === 'bing' || provider === 'google' || provider === 'opus'
           const cacheKey = hashKey(fullText, language, provider)
-          const cached = cacheGet(cacheKey)
+          const cached = cacheGet(state, cacheKey)
           if (cached !== undefined) {
             logEvent('skip', {
               reason: 'cache-hit',
@@ -2448,17 +2629,38 @@ async function* translateStream(original, config, signal, llm, currentModel) {
           }
 
           // Translate using segment approach — code blocks are preserved as-is
-          const glossaryContext = isFreeEngine ? undefined : [...glossary]
-          const translateSegment = (seg, m) => {
+          const glossaryContext = isFreeEngine ? undefined : [...state.glossary]
+          const engineCall = (seg) => {
             if (provider === 'opus') {
               const source = detected || 'en'
               const { pair } = resolveOfflinePair(source, language, config.offlinePair)
               if (!pair) return Promise.resolve(seg)
-              return translateOffline(seg, pair, config, signal, language)
+              return translateOffline(seg, pair, config, signal, language, state)
             }
             return isFreeEngine
               ? translateText(provider, seg, language, config.timeoutMs, signal)
-              : translateWithLlm(llm, provider, m || DEFAULT_MODEL, seg, language, config.timeoutMs, signal, glossaryContext)
+              : translateWithLlm(llm, provider, model, seg, language, config.timeoutMs, signal, glossaryContext)
+          }
+          // Every engine call goes through the session-backed durable cache:
+          // a hit skips the engine (including calls made before this process
+          // started), a miss is recorded so the session log reconstructs it.
+          // The record is rebuilt per call so a fallback retry that switched
+          // provider/model records the route that actually ran.
+          let sessionCacheHits = 0
+          const translateSegment = async (seg) => {
+            const recipe = provider === 'opus' ? `opus:${config.offlinePair}:${RECORD_RECIPE}`
+              : isFreeEngine ? `${provider}:${RECORD_RECIPE}`
+              : `llm:${model}:${RECORD_RECIPE}`
+            const record = translationRecord(
+              provider, provider === 'opus' ? '' : model, seg, detected || 'auto', language, recipe)
+            const hit = await sessionCacheLookup(recorder, sessionId, record, signal, state)
+            if (hit !== undefined) {
+              sessionCacheHits++
+              return hit
+            }
+            const translated = await engineCall(seg)
+            await sessionCacheRecord(recorder, sessionId, record, translated, state)
+            return translated
           }
           // Build a translate function that uses translateBySegments
           const translateFn = (text) => translateBySegments(text, translateSegment)
@@ -2504,12 +2706,12 @@ async function* translateStream(original, config, signal, llm, currentModel) {
           const finalText = postProcess(translated, null, null, language)
 
           // Cache
-          cacheSet(cacheKey, translated)
+          cacheSet(state, cacheKey, translated)
 
           // Extract glossary terms
           if (!isFreeEngine) {
             const terms = extractGlossaryTerms(textContent, finalText)
-            pushGlossary(terms)
+            pushGlossary(state, terms)
           }
 
           // Rewrite block.text rather than appending a synthetic delta, so a
@@ -2521,6 +2723,7 @@ async function* translateStream(original, config, signal, llm, currentModel) {
             mode, provider, model, targetLanguage: language,
             elapsedMs: Date.now() - startedAt,
             textChars: fullText.length, outChars: finalText.length,
+            sessionCacheHits,
           })
           // Debug: log source and translation for quality review
           const hadCode = segments.some(s => s.type === 'code')
@@ -2602,19 +2805,33 @@ const translateAls = new AsyncLocalStorage()
 
 export const inject = ['llm']
 
-/** Write to a volatile config field. Volatile fields are read-only to plugins
- *  via the public API (only `.get()`), but the runtime exposes a Symbol-keyed
- *  setter used internally by the Loader's `_commitVolatile`. We use the same
- *  global symbol so the plugin can push progress updates back to the client. */
-const _VOLATILE_WRITE = Symbol.for('cosmokit.volatile.write')
-function writeVolatile(field, value) {
-  if (field && typeof field[_VOLATILE_WRITE] === 'function') {
-    try { field[_VOLATILE_WRITE](value) } catch { /* best effort */ }
+/** One plugin instance's mutable state, created per apply() call: a hot
+ *  reload starts clean and no state is shared across plugin instances.
+ *  Module-level caches/singleton maps are a defensive-pattern violation —
+ *  shared state has exactly one owner, and that owner is this object. */
+function createState() {
+  return {
+    /** Offline engine: loaded CTranslate2 translators by model directory
+     *  (holding them open is the point — the ~5 s model-load cost is paid
+     *  once), plus the lazily imported native addon (`loader`:
+     *  null = not loaded, false = failed, else the import promise). */
+    offline: { translators: new Map(), loader: null },
+    /** LRU translation result cache, keyed by MD5(source + target + mode). */
+    cache: new Map(),
+    /** Terms earlier translations kept unchanged, injected into later
+     *  model-route prompts so terminology stays consistent. */
+    glossary: [],
+    /** model id → provider route, built once from the LLM runtime catalog. */
+    modelProviders: { map: new Map(), built: false },
+    /** Session-backed durable translation cache: the probed
+     *  `@deepseek-ai/dsh-session` module and per-session record indexes. */
+    records: { module: undefined, indexes: new Map() },
   }
 }
 
 export function apply(ctx, config) {
   const llm = ctx.get('llm')
+  const state = createState()
 
   // Boot marker. If this line is absent, apply() never ran — the module failed
   // to load, or the bundle is not enabled. If it is present but no 'hook' line
@@ -2666,9 +2883,16 @@ export function apply(ctx, config) {
     // the same model the conversation is already on.
     const currentModel = { provider: options.provider, model: options.model }
 
+    // Session recording: `recorder` carries the plugin context for the
+    // sessions/sessionPersistence service lookups, and loop-built requests
+    // stamp `options.sessionId` with the conversation the stream belongs to.
+    // Streams without a sessionId (direct ctx.llm.stream calls) translate
+    // with the in-memory cache only.
+    const recorder = { ctx }
+
     const original = next()
     return (async function* () {
-      yield* translateStream(original, cfg, options.signal, llm, currentModel)
+      yield* translateStream(original, cfg, options.signal, llm, currentModel, recorder, options.sessionId, state)
     })()
   })
 }
