@@ -987,15 +987,9 @@ function extractNouns(text) {
     }
   )
   // Now apply the known-noun list (covers lowercase-start nouns like "iOS").
+  // Placeholder tokens contain no Latin letters, so the noun regex can never
+  // match inside one — every remaining match is genuine prose to protect.
   stripped = stripped.replace(nounRegex, (m) => {
-    // Skip if already inside a placeholder.
-    if (stripped.includes('[[⟪')) {
-      const before = stripped.indexOf('[[⟪')
-      const after = stripped.lastIndexOf(']]')
-      if (before !== -1 && after !== -1 && stripped.indexOf(m) >= before && stripped.indexOf(m) <= after) {
-        return m
-      }
-    }
     const p = placeholder()
     spans.push(m)
     return p
@@ -1781,8 +1775,10 @@ const RECORD_REQUEST_TYPE = 'plugin:model-translator/request'
 const RECORD_RESULT_TYPE = 'plugin:model-translator/result'
 /** Bump when the translation recipe changes (prompt wording, params, pairing
  *  rules) so results cached under an older recipe are not served again.
- *  v2: engine text is noun-stripped and length-split before it is sent. */
-const RECORD_RECIPE = 2
+ *  v2: engine text is noun-stripped and length-split before it is sent.
+ *  v3: the known-noun list applies unconditionally after placeholders, fixing
+ *  nouns between two placeholders being sent to the engine unprotected. */
+const RECORD_RECIPE = 3
 
 /** The host's session package, probed once per plugin instance.
  *  `undefined` = not probed yet, `false` = unavailable, truthy = the module
@@ -2269,6 +2265,26 @@ async function translateSentence(text, config, signal, llm, currentModel, langua
   } else {
     provider = currentModel.provider
     model = currentModel.model
+  }
+
+  // Same-language skip (mirrors the block-end path): a sentence already in
+  // the target language is returned as-is — no wasted engine call, and no
+  // chance a model route rewrites text the user should see verbatim. Mixed
+  // CJK/Latin sentences still translate (the block-level exception applies
+  // here too).
+  if (detected !== null
+    && normalizeLanguage(detected, provider) === normalizeLanguage(language, provider)) {
+    const hasEnglish = /(?:^|[\s\.,;:!?])[a-zA-Z]{2,}(?=[\s\.,;:!?]|$)/.test(text)
+    if (!hasEnglish) {
+      logEvent('skip', {
+        reason: 'already-target-language',
+        what: `sentence (${provider})`,
+        mode: config.provider, provider,
+        detectedLanguage: detected, targetLanguage: language,
+        textChars: text.length,
+      })
+      return text
+    }
   }
 
   // Cache check (key on original text)
