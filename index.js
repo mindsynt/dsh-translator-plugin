@@ -1105,15 +1105,27 @@ function reinsertNouns(translated, spans) {
 function postProcess(translated, _codeSpans, _nounSpans, targetLanguage) {
   let result = translated
   if (languageFamily(targetLanguage) !== 'zh') return result
-  return localizePunctuation(
-    localizeBrackets(
-      localizeNumbers(
-        convertAbbreviations(
-          convertOrdinals(result)
+  return repairMarkdownLinks(
+    localizePunctuation(
+      localizeBrackets(
+        localizeNumbers(
+          convertAbbreviations(
+            convertOrdinals(result)
+          )
         )
       )
     )
   )
+}
+
+/** Repair markdown links and images whose ASCII destination parens a free
+ *  engine normalized to full-width ("[docs]（https://…）"). CommonMark only
+ *  links ASCII parens, so without this every such link renders as literal
+ *  text after translation. Only a URL destination is repaired — prose like
+ *  "[注]（见下文）" is left alone. */
+function repairMarkdownLinks(text) {
+  if (!text) return text
+  return text.replace(/(\])(?:[ \t]?（(https?:\/\/[^）\s]*)）)/g, '$1($2)')
 }
 
 /** Append one diagnostic line to the on-disk log. The host's `console.error`
@@ -1176,19 +1188,30 @@ function isGarbled(source, target) {
   // runs, CJK stutter ("卡卡卡卡卡"), or ellipsis padding ("洞察力... 测试...").
   // Only digit runs are exempt: they appear exclusively inside natural amounts
   // and IDs ("1250000", "210000").
-  const runs = target.match(/(.)\1{2,}/g) || []
+  //
+  // Whole-line structural markdown is stripped first: a faithful translation
+  // keeps table separator rows ("| --- |"), horizontal rules ("---", "***")
+  // and setext underlines ("==="), and none of those are padding. The inline
+  // syntax characters (* # | >) are exempt outright because bold-italic and
+  // header markers sit inside prose lines; padding with them is rare, and
+  // rules 3/5 still catch output-wide garbage.
+  const proseOnly = target.replace(/^[ \t]*[|:=\-*>+*_~`# \t]{3,}[ \t]*$/gm, ' ')
+  const runs = proseOnly.match(/(.)\1{2,}/g) || []
   for (const run of runs) {
     const ch = run[0]
     const code = ch.charCodeAt(0)
     if (code >= 0x30 && code <= 0x39) continue
+    if ('*#|>'.includes(ch)) continue
     return true
   }
 
   // 1b. Space-separated runs ("= = = = = =", "_ _ _ _") — Opus padding that
   // rule 1 above cannot catch, because whitespace breaks the contiguous run.
-  // Letters and digits are exempt (a spaced-out word or amount is not
-  // padding), everything else at 3+ is.
-  const spacedRuns = target.match(/(\S)\s+\1\s+\1/g) || []
+  // Same-line spaces/tabs only: a cross-line \s would read a markdown table
+  // ("| a |\n| b |\n| c |") as a spaced pipe run and reject every faithful
+  // table translation. Letters and digits are exempt (a spaced-out word or
+  // amount is not padding), everything else at 3+ is.
+  const spacedRuns = proseOnly.match(/(\S)[ \t]+\1[ \t]+\1/g) || []
   for (const sr of spacedRuns) {
     const ch = sr[0]
     const code = ch.charCodeAt(0)
@@ -1260,6 +1283,11 @@ function localizePunctuation(text) {
     .replace(/```[\s\S]*?```|~~~[\s\S]*?~~~/g, protect)
     // Inline code spans
     .replace(/`[^`\n]+`/g, protect)
+    // Whole-line structural markdown — table separator rows ("| --- |"),
+    // horizontal rules ("---"), setext underlines ("==="). The "--" → "——"
+    // dash rule below would otherwise shred a faithful table separator into
+    // "| ——————- |".
+    .replace(/^[ \t]*[|:=\-*>+*_~`# \t]{3,}[ \t]*$/gm, protect)
     // URLs
     .replace(/https?:\/\/[^\s)>"']+/g, protect)
     // Email addresses
@@ -1270,48 +1298,51 @@ function localizePunctuation(text) {
   // Now convert punctuation in the remaining prose.
   // In Chinese, there is NO space after punctuation (except newlines),
   // so we strip trailing spaces but preserve newlines and closing brackets.
+  // Every rule below converts in place and only consumes spaces/tabs — never
+  // a newline. \s variants here would span blank lines and collapse Markdown
+  // paragraphs ("$800.\n\n```bash" became "$800.```bash").
   work = work
     // Ellipsis first (before single-period replacement)
     .replace(/\.\.\./g, '……')
     // Dash
     .replace(/--/g, '——')
-    // Period at end of line (before \n): preserve newline
-    .replace(/\.\s*\n/g, '。\n')
+    // Period at end of line: convert and strip trailing spaces, keep the newline
+    .replace(/\.[ \t]*\n/g, '。\n')
     // Period followed by end of string or closing bracket or other punctuation
     .replace(/\.(?=\s*$)/g, '。')
-    .replace(/\.(?=\s*[)\]"!?])\s*/g, '。')
-    .replace(/\.\s+(?=[^<\n])/g, '。')
-    // Comma at end of line: preserve newline
-    .replace(/,\s*\n/g, '，\n')
+    .replace(/\.(?=\s*[)\]"!?])[ \t]*/g, '。')
+    .replace(/\.[ \t]+(?=[^<\n])/g, '。')
+    // Comma at end of line: convert and strip trailing spaces, keep the newline
+    .replace(/,[ \t]*\n/g, '，\n')
     // Comma at end of string
     .replace(/,$/, '，')
     // Comma followed by closing bracket
-    .replace(/,\s*([)\]"'])\s*/g, '，$1')
+    .replace(/,([ \t]*[)\]"'])[ \t]*/g, '，$1')
     // Comma followed by space
-    .replace(/,\s+(?=[^<\n])/g, '，')
+    .replace(/,[ \t]+(?=[^<\n])/g, '，')
     // Question mark at end of line
-    .replace(/\?\s*\n/g, '？\n')
+    .replace(/\?[ \t]*\n/g, '？\n')
     .replace(/\?(?=\s*$)/g, '？')
-    .replace(/\?(?=\s*[)\]"!?])\s*/g, '？')
-    .replace(/\?\s+(?=[^<\n])/g, '？')
+    .replace(/\?(?=\s*[)\]"!?])[ \t]*/g, '？')
+    .replace(/\?[ \t]+(?=[^<\n])/g, '？')
     // Exclamation mark at end of line
-    .replace(/!\s*\n/g, '！\n')
+    .replace(/![ \t]*\n/g, '！\n')
     .replace(/!(?=\s*$)/g, '！')
-    .replace(/!(?=\s*[)\]"!?])\s*/g, '！')
-    .replace(/!\s+(?=[^<\n])/g, '！')
+    .replace(/!(?=\s*[)\]"!?])[ \t]*/g, '！')
+    .replace(/![ \t]+(?=[^<\n])/g, '！')
     // Semicolon at end of line
-    .replace(/;\s*\n/g, '；\n')
+    .replace(/;[ \t]*\n/g, '；\n')
     .replace(/;(?=\s*$)/g, '；')
-    .replace(/;\s*([)\]"'])\s*/g, '；$1')
-    .replace(/;\s+(?=[^<\n])/g, '；')
-    // Colon at end of line (before \n): preserve newline
-    .replace(/:\s*\n/g, '：\n')
+    .replace(/;([ \t]*[)\]"'])[ \t]*/g, '；$1')
+    .replace(/;[ \t]+(?=[^<\n])/g, '；')
+    // Colon at end of line
+    .replace(/:[ \t]*\n/g, '：\n')
     // Colon followed by end of string
     .replace(/:$/, '：')
     // Colon followed by closing bracket
-    .replace(/:\s*([)\]"'])\s*/g, '：$1')
+    .replace(/:([ \t]*[)\]"'])[ \t]*/g, '：$1')
     // Colon followed by space (but not in time format like 3:30)
-    .replace(/:\s+(?=[^<\n\d])/g, '：')
+    .replace(/:[ \t]+(?=[^<\n\d])/g, '：')
 
   // Restore protected spans.
   work = work.replace(/\x00(\d+)\x00/g, (_, i) => protectedSpans[parseInt(i, 10)] || '')
@@ -1534,6 +1565,10 @@ function localizeBrackets(text) {
     // Protect code blocks/spans, URLs, emails, version numbers
     .replace(/```[\s\S]*?```|~~~[\s\S]*?~~~/g, protect)
     .replace(/`[^`\n]+`/g, protect)
+    // Markdown links and images: [text](dest "title") / ![alt](dest) — the
+    // ASCII parens are link syntax and must survive CJK bracket localization,
+    // otherwise every link renders as literal text after translation.
+    .replace(/!?\[[^\]\n]*\]\([^)\n]*\)/g, protect)
     .replace(/https?:\/\/[^\s)>"']+/g, protect)
     .replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, protect)
     .replace(/(?:\bv\d+(?:\.\d+)+[a-zA-Z0-9-]*|\b\d+(?:\.\d+)+-[a-zA-Z0-9-]*)/g, protect)
@@ -2319,18 +2354,23 @@ async function translateSentence(text, config, signal, llm, currentModel, langua
   let sessionCacheHits = 0
   const translateFn = async (seg) => {
     const { stripped, spans } = extractNouns(seg)
+    // Same whitespace preservation as the block-end path.
+    const lead = (stripped.match(/^\s*/) || [''])[0]
+    const trail = (stripped.match(/\s*$/) || [''])[0]
+    const core = stripped.slice(lead.length, stripped.length - trail.length)
+    if (core === '') return seg
     const recipe = provider === 'opus' ? `opus:${config.offlinePair}:${RECORD_RECIPE}`
       : isFreeEngine ? `${provider}:${RECORD_RECIPE}`
       : `llm:${model}:${RECORD_RECIPE}`
     const record = translationRecord(
-      provider, provider === 'opus' ? '' : model, stripped, detected || 'auto', language, recipe)
+      provider, provider === 'opus' ? '' : model, core, detected || 'auto', language, recipe)
     const hit = await sessionCacheLookup(recorder, sessionId, record, signal, state)
     if (hit !== undefined) {
       sessionCacheHits++
-      return reinsertNouns(hit, spans)
+      return lead + reinsertNouns(hit, spans) + trail
     }
-    const engineOut = await engineCall(stripped)
-    const translated = reinsertNouns(engineOut, spans)
+    const engineOut = await engineCall(core)
+    const translated = lead + reinsertNouns(engineOut, spans) + trail
     await sessionCacheRecord(recorder, sessionId, record, engineOut, state)
     return translated
   }
@@ -2728,18 +2768,27 @@ async function* translateStream(original, config, signal, llm, currentModel, rec
             // engine sees — and the nouns are reinserted from this segment's
             // own spans either way.
             const { stripped, spans } = extractNouns(seg)
+            // Engines trim their output, so the segment's own leading and
+            // trailing whitespace must not reach them: strip it, translate
+            // the core, and re-attach it around the result — otherwise the
+            // whitespace separating segments (blank lines before a fence,
+            // spaces around inline code) is lost on reassembly.
+            const lead = (stripped.match(/^\s*/) || [''])[0]
+            const trail = (stripped.match(/\s*$/) || [''])[0]
+            const core = stripped.slice(lead.length, stripped.length - trail.length)
+            if (core === '') return seg
             const recipe = provider === 'opus' ? `opus:${config.offlinePair}:${RECORD_RECIPE}`
               : isFreeEngine ? `${provider}:${RECORD_RECIPE}`
               : `llm:${model}:${RECORD_RECIPE}`
             const record = translationRecord(
-              provider, provider === 'opus' ? '' : model, stripped, detected || 'auto', language, recipe)
+              provider, provider === 'opus' ? '' : model, core, detected || 'auto', language, recipe)
             const hit = await sessionCacheLookup(recorder, sessionId, record, signal, state)
             if (hit !== undefined) {
               sessionCacheHits++
-              return reinsertNouns(hit, spans)
+              return lead + reinsertNouns(hit, spans) + trail
             }
-            const engineOut = await engineCall(stripped)
-            const translated = reinsertNouns(engineOut, spans)
+            const engineOut = await engineCall(core)
+            const translated = lead + reinsertNouns(engineOut, spans) + trail
             await sessionCacheRecord(recorder, sessionId, record, engineOut, state)
             return translated
           }

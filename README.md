@@ -121,6 +121,14 @@ per provider — `zh-Hans` / `zh-Hant` for Bing, `zh-CN` / `zh-TW` for Google.
   the stream carries no session id, translation proceeds with the in-memory
   cache alone. The identity covers provider, model, exact text, both
   languages and a recipe revision, so a prompt change starts a fresh cache.
+- **Markdown structure survives translation.** Headers, bold/italic, list
+  markers, blockquotes, tables and blank lines pass through the pipeline
+  intact: whole-line table separators and horizontal rules are exempt from
+  both the garbled-output detector and the CJK dash rule, and the
+  segment-level whitespace that separates blocks is preserved instead of
+  trimmed away. Link and image destinations keep their ASCII parens — and
+  when a free engine normalizes them to full-width ("[docs]（https://…）"),
+  the URL destination is repaired back to CommonMark syntax on the way out.
 - **Translation calls are marked auxiliary.** Model-route translation requests
   carry `purpose: 'translation'`, the same mechanism `session-title` and
   compaction use, so pipeline observers can tell an auxiliary call from a
@@ -285,6 +293,11 @@ entirely.
   永不进入模型可见面；且为尽力而为 —— 会话包无法导入或流上没有 sessionId 时，
   翻照常进行，只是退回内存缓存。缓存身份覆盖 provider、模型、精确原文、两种语言
   和配方修订号，因此提示词一变，缓存即从零开始。
+- **Markdown 结构在翻译后原样保留。** 标题、加粗、列表标记、引用、表格和空行
+  完整通过管线：整行表格分隔线与水平线既不触发乱码检测、也不被中文破折号规则
+  粉碎；分段之间的空白（围栏前的空行、行内代码两侧的空格）在重装时原样接回，
+  不会被引擎的 trim 吃掉。链接与图片目标保持半角括号 —— 若免费引擎把它们归一化
+  成全角（「[文档]（https://…）」），输出前会把 URL 目标修复回 CommonMark 语法。
 - **翻译调用带辅助标识。** 模型路由的翻译请求携带 `purpose: 'translation'` ——
   与 `session-title`、压缩相同的机制 —— 让管道观察者能把它和对话轮次区分开。
 - **相邻块带上下文翻译。** 上一段已译内容（原文 + 译文）的尾部会随提示词一起发送，
