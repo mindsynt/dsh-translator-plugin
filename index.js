@@ -4,7 +4,7 @@
  *  this machine with no network round trip. */
 
 import { createHash } from 'node:crypto'
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { createReadStream, createWriteStream } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -90,12 +90,6 @@ const NLLB_REPOS = {
  *  smaller segments rather than being rejected. */
 const OPUS_MAX_CHARS = 2000
 
-/** Per-block segment concurrency for the offline engine only. Offline inference
- *  is synchronous CPU work, so concurrent segments do not overlap — they fight
- *  for the same cores and finish no faster than serial execution. Serial keeps
- *  the event loop predictably busy and makes the latency add up honestly. */
-const OPUS_SEGMENT_CONCURRENCY = 1
-
 /** Map a normalized language tag onto its family code, so a user's `zh-CN`
  *  target resolves to the `zh` model. Unknown tags keep their own spelling. */
 function pairSide(tag) {
@@ -149,7 +143,7 @@ function resolveOfflinePair(detected, targetLanguage, configured) {
     if (!SUPPORTED_PAIRS.has(configured)) {
       throw new Error(
         `offlinePair "${configured}" is not available; Opus-MT pairs: ` +
-        `[...SUPPORTED_PAIRS].join(', '); NLLB models: ` +
+        `${[...SUPPORTED_PAIRS].join(', ')}; NLLB models: ` +
         Object.keys(NLLB_REPOS).map(k => `nllb-${k}`).join(', '))
     }
     return { pair: configured, fallback: false }
@@ -293,17 +287,63 @@ async function downloadFile(url, dest, progressFile, currentFile, totalFiles) {
   }
 }
 
-/** Make sure a complete model for `pair` exists under `dir`, downloading it
- *  from the configured model sources when `autoDownload` is on. Resolves to
- *  the directory path on success, or throws with a message that names what
- *  was tried. Tries each source in order until one succeeds.
- */
+/** Build the download URL for one model file from a source base. HuggingFace
+ *  and its mirrors share the `/resolve/main` shape; ModelScope serves the same
+ *  layout under `/resolve/master`. */
+function modelFileUrl(base, repo, file) {
+  const trimmed = base.replace(/\/+$/, '')
+  const host = new URL(trimmed).host
+  if (host.endsWith('modelscope.cn')) return `${trimmed}/${repo}/resolve/master/${file}`
+  return `${trimmed}/${repo}/resolve/main/${file}`
+}
+
+/** Make sure a complete model for `pair` exists under the default model
+ *  directory, downloading it from the model sources when `offlineAutoDownload`
+ *  is on. Resolves to the directory path on success; throws with a message
+ *  that names what was tried. Tries each source in order until one succeeds —
+ *  a source that fails mid-way leaves its completed files behind and the next
+ *  source skips them, so a flaky mirror never restarts from zero. */
 async function ensureModel(pair, config) {
   const dir = modelDirFor(pair, '')
   if (modelLooksComplete(dir)) return dir
-  throw new Error(
-    'offline model for "' + pair + '" not found. Only Opus-MT en-zh is bundled. ' +
-    'Place model files in ' + dir)
+
+  const isNllb = pair.startsWith('nllb-')
+  const repo = isNllb ? NLLB_REPOS[pair.slice('nllb-'.length)] : HF_REPO(pair)
+  if (!repo) throw new Error(`offline model for "${pair}" is not available`)
+  const files = isNllb ? MODEL_FILES_NLLB : MODEL_FILES_OPUS
+
+  if (!config.offlineAutoDownload) {
+    throw new Error(
+      `offline model for "${pair}" is not installed. Only en-zh ships bundled. ` +
+      `Turn on offlineAutoDownload to download it on first use (${repo}), ` +
+      `or place the CTranslate2 model files in ${dir}`)
+  }
+
+  const missing = files.filter((f) => !existsSync(path.join(dir, f)))
+  mkdirSync(dir, { recursive: true })
+  const progressFile = path.join(dir, '.download-progress')
+  logEvent('offline-download-start', { pair, repo, dir, files: missing.length })
+  let lastFailure = ''
+  for (const base of DEFAULT_MODEL_SOURCES) {
+    let ok = true
+    for (const file of missing) {
+      const url = modelFileUrl(base, repo, file)
+      if (await downloadFile(url, path.join(dir, file), progressFile, file, missing)) continue
+      ok = false
+      lastFailure = url
+      break
+    }
+    if (ok) {
+      try { unlinkSync(progressFile) } catch { /* best effort */ }
+      if (modelLooksComplete(dir)) {
+        logEvent('offline-download-done', { pair, repo, dir })
+        return dir
+      }
+      throw new Error(`downloaded model for "${pair}" is still incomplete in ${dir}`)
+    }
+    logEvent('offline-download-source-failed', { pair, base, url: lastFailure })
+  }
+  throw new Error(`could not download offline model "${pair}" from any source; last failure: ${lastFailure}`)
 }
 
 /** Lazily load the native addon once. Fails once and stays failed, so an
@@ -543,6 +583,13 @@ export const Config = z.object({
   offlineThreads: z.natural().min(1).max(32).default(4).volatile(),
   // Beam search width.
   offlineBeamSize: z.natural().min(1).max(12).default(4).volatile(),
+  // Download a missing language pair on first use (~160MB per Opus-MT pair,
+  // ~600MB for a NLLB model) from the public CTranslate2 conversions on
+  // HuggingFace, trying the mirror sources in order. When off, only the
+  // bundled en-zh pair or already-cached models work. Download progress is
+  // written to the JSONL log and to a .download-progress file in the model
+  // directory — there is no UI channel for it.
+  offlineAutoDownload: z.boolean().default(false).volatile(),
 })
 
 /** Resolve 'auto' to a concrete language code. Prefers the client-pushed
@@ -797,11 +844,6 @@ function splitText(text, chunkSize) {
   return chunks
 }
 
-/** Per-block segment translation concurrency. Free engines and model routes
- * alike tolerate a few in-flight requests; this bounds fan-out so a long
- * block does not hammer a rate-limited provider. */
-const SEGMENT_CONCURRENCY = 4
-
 /** Maximum cache entries before LRU eviction kicks in. Each entry is a
  *  source→translated text pair, bounded so memory stays flat across long
  *  sessions without ever evicting a useful translation. */
@@ -996,17 +1038,31 @@ function splitByCodeBlocks(text) {
  * Translate text using segment translation approach.
  * Code blocks are preserved as-is, only text segments are translated.
  */
-async function translateBySegments(text, translateFn) {
+async function translateBySegments(text, translateFn, chunkSize) {
   const segments = splitByCodeBlocks(text)
   if (segments.length === 1 && segments[0].type === 'text') {
-    return translateFn(text)
+    return translateSegmentSized(segments[0].content, translateFn, chunkSize)
   }
   for (const seg of segments) {
     if (seg.type === 'text' && seg.content.trim() !== '') {
-      seg.content = await translateFn(seg.content)
+      seg.content = await translateSegmentSized(seg.content, translateFn, chunkSize)
     }
   }
   return segments.map(s => s.content).join('')
+}
+
+/** Translate one text segment, splitting it into provider-sized pieces when it
+ *  exceeds `chunkSize` (paragraph → sentence → whitespace boundaries, joined
+ *  back in order). Neural engines have hard context limits — an oversized
+ *  piece aborts the whole call — so this bounds every piece before it reaches
+ *  the engine. `chunkSize` undefined means no length split. */
+async function translateSegmentSized(content, translateFn, chunkSize) {
+  if (!chunkSize || content.length <= chunkSize) return translateFn(content)
+  const pieces = splitText(content, chunkSize)
+  if (pieces.length === 1) return translateFn(content)
+  const out = []
+  for (const piece of pieces) out.push(await translateFn(piece))
+  return out.join('')
 }
 
 
@@ -1724,8 +1780,9 @@ function cacheSet(state, key, value) {
 const RECORD_REQUEST_TYPE = 'plugin:model-translator/request'
 const RECORD_RESULT_TYPE = 'plugin:model-translator/result'
 /** Bump when the translation recipe changes (prompt wording, params, pairing
- *  rules) so results cached under an older recipe are not served again. */
-const RECORD_RECIPE = 1
+ *  rules) so results cached under an older recipe are not served again.
+ *  v2: engine text is noun-stripped and length-split before it is sent. */
+const RECORD_RECIPE = 2
 
 /** The host's session package, probed once per plugin instance.
  *  `undefined` = not probed yet, `false` = unavailable, truthy = the module
@@ -1912,43 +1969,6 @@ function extractGlossaryTerms(source, translated) {
 function pushGlossary(state, terms) {
   for (const t of terms) state.glossary.unshift(t)
   if (state.glossary.length > GLOSSARY_MAX) state.glossary.length = GLOSSARY_MAX
-}
-
-/** Translate `text` by splitting it into provider-sized segments and
- * translating them concurrently (bounded), then joining in order. Total wall
- * time is roughly one segment round, not N. On ANY segment failure the whole
- * call throws so the caller falls back to the original block verbatim — a
- * block is never emitted half-translated (the documented guarantee).
- *
- * `chunkSize` and `concurrency` are both provider-specific: the offline engine
- * has a hard 512-token context limit, so its segments must be smaller than
- * maxTextChars, and it does synchronous CPU work, so its segments must not run
- * in parallel.
- * @param translate - function translating one segment string to the target language.
- * @param concurrency - max segments in flight; defaults to SEGMENT_CONCURRENCY. */
-async function translateLong(translate, text, chunkSize, concurrency = SEGMENT_CONCURRENCY) {
-  if (!text) return ''
-  const segments = splitText(text, chunkSize)
-  if (segments.length === 1) return translate(text)
-  const results = new Array(segments.length)
-  let cursor = 0
-  let failed = false
-  async function worker() {
-    while (!failed) {
-      const i = cursor++
-      if (i >= segments.length) return
-      try {
-        results[i] = await translate(segments[i])
-      } catch (_e) {
-        // One bad segment fails the whole block so it is never half-translated.
-        failed = true
-      }
-    }
-  }
-  const workers = Array.from({ length: Math.min(concurrency, segments.length) }, worker)
-  await Promise.all(workers)
-  if (failed) throw new Error('translation segment failed')
-  return results.join('')
 }
 
 /** Call the free translation API (bing/google) and return the translated text. */
@@ -2278,28 +2298,36 @@ async function translateSentence(text, config, signal, llm, currentModel, langua
       : translateWithLlm(llm, provider, model, seg, language, config.timeoutMs, signal, glossaryContext, context)
   }
   // Session-backed durable cache around every engine call — same wrapping as
-  // the block-end path: a hit skips the engine, a miss is recorded.
+  // the block-end path: a hit skips the engine, a miss is recorded. The engine
+  // sees noun-stripped text; the cache identity is that stripped text.
   let sessionCacheHits = 0
   const translateFn = async (seg) => {
+    const { stripped, spans } = extractNouns(seg)
     const recipe = provider === 'opus' ? `opus:${config.offlinePair}:${RECORD_RECIPE}`
       : isFreeEngine ? `${provider}:${RECORD_RECIPE}`
       : `llm:${model}:${RECORD_RECIPE}`
     const record = translationRecord(
-      provider, provider === 'opus' ? '' : model, seg, detected || 'auto', language, recipe)
+      provider, provider === 'opus' ? '' : model, stripped, detected || 'auto', language, recipe)
     const hit = await sessionCacheLookup(recorder, sessionId, record, signal, state)
     if (hit !== undefined) {
       sessionCacheHits++
-      return hit
+      return reinsertNouns(hit, spans)
     }
-    const translated = await engineCall(seg)
-    await sessionCacheRecord(recorder, sessionId, record, translated, state)
+    const engineOut = await engineCall(stripped)
+    const translated = reinsertNouns(engineOut, spans)
+    await sessionCacheRecord(recorder, sessionId, record, engineOut, state)
     return translated
   }
 
-  // Translate using segment approach — code blocks are preserved as-is
+  // Translate using segment approach — code blocks are preserved as-is. The
+  // offline Marian models abort on oversized input, so their pieces are
+  // additionally capped at OPUS_MAX_CHARS regardless of maxTextChars.
+  const chunkSize = provider === 'opus'
+    ? Math.min(config.maxTextChars, OPUS_MAX_CHARS)
+    : config.maxTextChars
   let translated
   try {
-    translated = await translateBySegments(text, translateFn)
+    translated = await translateBySegments(text, translateFn, chunkSize)
   } catch (_e) {
     return text
   }
@@ -2678,22 +2706,34 @@ async function* translateStream(original, config, signal, llm, currentModel, rec
           // provider/model records the route that actually ran.
           let sessionCacheHits = 0
           const translateSegment = async (seg) => {
+            // Proper nouns, URLs, template variables and identifiers are
+            // swapped for [[⟪*n⟫]] placeholders and never reach the engine;
+            // the cache identity is the stripped text — exactly what the
+            // engine sees — and the nouns are reinserted from this segment's
+            // own spans either way.
+            const { stripped, spans } = extractNouns(seg)
             const recipe = provider === 'opus' ? `opus:${config.offlinePair}:${RECORD_RECIPE}`
               : isFreeEngine ? `${provider}:${RECORD_RECIPE}`
               : `llm:${model}:${RECORD_RECIPE}`
             const record = translationRecord(
-              provider, provider === 'opus' ? '' : model, seg, detected || 'auto', language, recipe)
+              provider, provider === 'opus' ? '' : model, stripped, detected || 'auto', language, recipe)
             const hit = await sessionCacheLookup(recorder, sessionId, record, signal, state)
             if (hit !== undefined) {
               sessionCacheHits++
-              return hit
+              return reinsertNouns(hit, spans)
             }
-            const translated = await engineCall(seg)
-            await sessionCacheRecord(recorder, sessionId, record, translated, state)
+            const engineOut = await engineCall(stripped)
+            const translated = reinsertNouns(engineOut, spans)
+            await sessionCacheRecord(recorder, sessionId, record, engineOut, state)
             return translated
           }
-          // Build a translate function that uses translateBySegments
-          const translateFn = (text) => translateBySegments(text, translateSegment)
+          // Build a translate function that uses translateBySegments. The
+          // offline Marian models abort on oversized input, so their pieces
+          // are additionally capped at OPUS_MAX_CHARS regardless of maxTextChars.
+          const chunkSize = provider === 'opus'
+            ? Math.min(config.maxTextChars, OPUS_MAX_CHARS)
+            : config.maxTextChars
+          const translateFn = (text) => translateBySegments(text, translateSegment, chunkSize)
 
           let translated
           try {
@@ -2820,10 +2860,11 @@ function snapshot(config) {
     timeoutMs: config.timeoutMs.get(),
     maxTextChars: config.maxTextChars.get(),
     offlinePair: config.offlinePair.get(),
-    
+
     offlineThreads: config.offlineThreads.get(),
     offlineBeamSize: config.offlineBeamSize.get(),
-    
+    offlineAutoDownload: config.offlineAutoDownload.get(),
+
   }
 }
 

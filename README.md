@@ -66,7 +66,7 @@ exposes all of them, including the two advanced ones:
 | `offlineModelDir` | *(empty)* | Offline only. Override for `$DSH_HOME/model-translator/models` |
 | `offlineThreads` | `4` | Offline only. CPU threads for the CTranslate2 backend, 1–32 |
 | `offlineBeamSize` | `4` | Offline only. Beam search width, 1–12 |
-| `offlineAutoDownload` | `false` | Offline only. When off, only bundled or already-cached models work; when on, other pairs download ~160 MB from HuggingFace on first use |
+| `offlineAutoDownload` | `false` | Offline only. When off, only bundled or already-cached models work; when on, other pairs download ~160 MB on first use (HuggingFace, hf-mirror and ModelScope tried in order). Progress goes to the JSONL log and a `.download-progress` file in the model directory — there is no UI channel for it |
 | `interfaceLanguage` | `auto` | Not editable. Mirrors the UI locale so `targetLanguage: auto` resolves to what you actually read, not the host `LANG` |
 
 The form offers `auto`, `zh`, `en`, `ja`, `ko`, `fr`, `de`, `es`; the config
@@ -76,9 +76,11 @@ per provider — `zh-Hans` / `zh-Hant` for Bing, `zh-CN` / `zh-TW` for Google.
 
 ### What it never breaks
 
-- **Code is never translated.** Fenced blocks and inline code are swapped for
-  `[[CODE0]]`-style placeholders before the text leaves the process, then
-  reinserted verbatim. If a translation drops a placeholder, the code is
+- **Code and identifiers are never translated.** Fenced code blocks are split
+  out as their own segments and never sent to any engine. Inline proper nouns,
+  CamelCase identifiers, URLs, version numbers and template variables are
+  swapped for `[[⟪*0⟫]]`-style placeholders before the text leaves the
+  process, then reinserted verbatim; a placeholder the translation dropped is
   appended back at the end — it is never lost.
 - **Translation failures never break the stream.** Any error — a timeout, an
   HTTP failure, a malformed response, an unsupported model, or a translation
@@ -99,7 +101,7 @@ per provider — `zh-Hans` / `zh-Hant` for Bing, `zh-CN` / `zh-TW` for Google.
   (the route's advertised effort vocabulary), `hook`,
   `translated`, `skip` (`short-block`, `streamed-live`,
   `already-target-language`, `cache-hit`), `fallback`, `fail`,
-  `session-records` and `session-record-fail` — are appended
+  `session-records`, `session-record-fail` and the `offline-download-*` trio — are appended
   as JSONL to `$DSH_HOME/logs/model-translator.log` (falling back to
   `~/.dsh/logs/` — the host does not export `DSH_HOME` — and finally to
   `$TMPDIR/logs/`). The host's `console.error` goes to whatever terminal
@@ -243,7 +245,7 @@ entirely.
 | `offlineModelDir` | *(空)* | 仅离线。覆盖 `$DSH_HOME/model-translator/models` |
 | `offlineThreads` | `4` | 仅离线。CTranslate2 后端 CPU 线程数，1–32 |
 | `offlineBeamSize` | `4` | 仅离线。束搜索宽度，1–12 |
-| `offlineAutoDownload` | `false` | 仅离线。关闭时仅使用捆绑或已缓存的模型；开启后其他语言对首次使用时从 HuggingFace 下载约 160 MB |
+| `offlineAutoDownload` | `false` | 仅离线。关闭时仅使用捆绑或已缓存的模型；开启后其他语言对首次使用时下载约 160 MB（按顺序尝试 HuggingFace、hf-mirror 与 ModelScope）。进度写入 JSONL 日志和模型目录下的 `.download-progress` 文件 —— 没有UI通道 |
 | `interfaceLanguage` | `auto` | 不可编辑。镜像 UI 语言，让 `targetLanguage: auto` 解析成你实际阅读的语言，而不是 host `LANG` |
 
 表单提供 `auto`、`zh`、`en`、`ja`、`ko`、`fr`、`de`、`es`；配置本身接受任意语言
@@ -252,8 +254,9 @@ entirely.
 
 ### 它不会弄坏什么
 
-- **代码从不被翻译。** 围栏代码块与行内代码在文本离开进程前被替换成 `[[CODE0]]`
-  形式的占位符，翻译完再原样插回。如果翻译把占位符弄丢了，代码会被追加回结尾 ——
+- **代码与标识符从不被翻译。** 围栏代码块会被拆成独立段落，不发给任何引擎。行内
+  专有名词、CamelCase 标识符、URL、版本号和模板变量在文本离开进程前被替换成
+  `[[⟪*0⟫]]` 形式的占位符，翻译完再原样插回；翻译丢掉的占位符会被追加回结尾 ——
   代码不会丢。
 - **翻译失败不会弄断流。** 任何错误 —— 超时、HTTP 失败、响应格式异常、模型不受
   支持、或者整条翻译返回空 —— 都会把原文原样冲出。每一次失败同时写入
@@ -268,7 +271,8 @@ entirely.
   响应才会让翻译失败。
 - **每个决策都落盘。** 所有事件 —— `boot`、`capability`（该路由声明的 effort 词汇表）、`hook`、`translated`、`skip`
   （`short-block` / `streamed-live` / `already-target-language` / `cache-hit`）、
-  `fallback`、`fail`、`session-records`、`session-record-fail` —— 都以 JSONL 追加到 `$DSH_HOME/logs/model-translator.log`
+  `fallback`、`fail`、`session-records`、`session-record-fail` 及 `offline-download-*` 三件套 —— 都以 JSONL 追加到
+  `$DSH_HOME/logs/model-translator.log`
   （回退到 `~/.dsh/logs/` —— host 并没有导出 `DSH_HOME` —— 最后回退到 `$TMPDIR/logs/`）。host 的 `console.error` 只会写进启动它的那个终端，
   往往是没人读得到的伪终端；文件跨重启保留，且进程内任何人均可读。没有 `boot`
   行说明 `apply()` 从未执行（模块加载失败或 bundle 被禁用）；有 `boot` 但没有

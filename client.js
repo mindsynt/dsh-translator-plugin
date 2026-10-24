@@ -297,6 +297,7 @@ window.__ModuleLoader__.load({
       const [timeoutMs,     setTimeoutMs]     = useState(value.timeoutMs     ?? 10000);
       const [maxTextChars,  setMaxTextChars]  = useState(value.maxTextChars  ?? 4000);
       const [offlinePair,   setOfflinePair]   = useState(value.offlinePair   ?? 'auto');
+      const [offlineAutoDownload, setOfflineAutoDownload] = useState(value.offlineAutoDownload ?? false);
       const [prefetching, setPrefetching] = useState(false);
       const [downloadProgress, setDownloadProgress] = useState(null);
       const [offlinePairs,  setOfflinePairs]  = useState([]);
@@ -313,7 +314,7 @@ window.__ModuleLoader__.load({
       useEffect(() => {
         const v = snapshot.value ?? {};
         const sig = [v.provider, v.model, v.targetLanguage, v.translateOutput, v.translateThinking,
-          v.translateMode, v.timeoutMs, v.maxTextChars, v.offlinePair].join('\u0001');
+          v.translateMode, v.timeoutMs, v.maxTextChars, v.offlinePair, v.offlineAutoDownload].join('\u0001');
         if (sig === lastSig.current) return;
         lastSig.current = sig;
         setProvider(v.provider ?? 'auto');
@@ -325,6 +326,7 @@ window.__ModuleLoader__.load({
         setTimeoutMs(v.timeoutMs ?? 10000);
         setMaxTextChars(v.maxTextChars ?? 4000);
         setOfflinePair(v.offlinePair ?? 'auto');
+        setOfflineAutoDownload(v.offlineAutoDownload ?? false);
         setError(null);
       }, [snapshot.value]);
 
@@ -376,6 +378,7 @@ window.__ModuleLoader__.load({
             { op: 'set', path: ['timeoutMs'],       value: timeout },
             { op: 'set', path: ['maxTextChars'],    value: maxChars },
             { op: 'set', path: ['offlinePair'],     value: offlinePair },
+            { op: 'set', path: ['offlineAutoDownload'], value: offlineAutoDownload },
           ];
           if (isModelMode) ops.push({ op: 'set', path: ['model'], value: model });
 
@@ -472,6 +475,16 @@ window.__ModuleLoader__.load({
             OFFLINE_PAIR_VALUES.map((v) => h('option', { key: v, value: v }, offlinePairLabel(t, v))),
           ),
           h('p', { style: S.desc }, t('offlinePairHint')),
+          h('label', { style: S.check },
+            h('input', {
+              type: 'checkbox',
+              checked: offlineAutoDownload,
+              onChange: (e) => { setOfflineAutoDownload(e.target.checked); setSaved(false); },
+              disabled,
+            }),
+            h('span', {}, t('offlineAutoDownload')),
+          ),
+          h('p', { style: S.desc }, t('offlineAutoDownloadHint')),
           h('p', { style: S.desc }, t('offlineNote')),
         ) : null,
 
