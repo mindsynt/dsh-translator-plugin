@@ -2318,6 +2318,7 @@ async function translateSentence(text, config, signal, llm, currentModel, langua
         detectedLanguage: detected, targetLanguage: language,
         textChars: text.length,
       })
+      pushTranslationContext(context, text, text)
       return text
     }
   }
@@ -2367,11 +2368,14 @@ async function translateSentence(text, config, signal, llm, currentModel, langua
     const hit = await sessionCacheLookup(recorder, sessionId, record, signal, state)
     if (hit !== undefined) {
       sessionCacheHits++
-      return lead + reinsertNouns(hit, spans) + trail
+      const cached = lead + reinsertNouns(hit, spans) + trail
+      pushTranslationContext(context, seg, cached)
+      return cached
     }
     const engineOut = await engineCall(core)
     const translated = lead + reinsertNouns(engineOut, spans) + trail
     await sessionCacheRecord(recorder, sessionId, record, engineOut, state)
+    pushTranslationContext(context, seg, translated)
     return translated
   }
 
@@ -2640,6 +2644,7 @@ async function* translateStream(original, config, signal, llm, currentModel, rec
             targetLanguage: language,
             textChars: (entry.yieldedText || '').length,
           })
+          pushTranslationContext(context, entry.yieldedText, entry.yieldedText)
           yield chunk
           break
         }
@@ -2721,6 +2726,7 @@ async function* translateStream(original, config, signal, llm, currentModel, rec
                 detectedLanguage: detected, targetLanguage: language,
                 textChars: fullText.length,
               })
+              pushTranslationContext(context, fullText, fullText)
               yield { ...chunk, block: { ...chunk.block, text: fullText } }
               break
             }
@@ -2738,6 +2744,7 @@ async function* translateStream(original, config, signal, llm, currentModel, rec
               textChars: fullText.length,
             })
             const finalText = postProcess(cached, null, null, language)
+            pushTranslationContext(context, fullText, finalText)
             yield { ...chunk, block: { ...chunk.block, text: finalText } }
             break
           }
@@ -2785,11 +2792,19 @@ async function* translateStream(original, config, signal, llm, currentModel, rec
             const hit = await sessionCacheLookup(recorder, sessionId, record, signal, state)
             if (hit !== undefined) {
               sessionCacheHits++
-              return lead + reinsertNouns(hit, spans) + trail
+              const cached = lead + reinsertNouns(hit, spans) + trail
+              // The displayed text advances the rolling context even on a
+              // cache hit, so the next segment continues from what the user
+              // actually reads.
+              pushTranslationContext(context, seg, cached)
+              return cached
             }
             const engineOut = await engineCall(core)
             const translated = lead + reinsertNouns(engineOut, spans) + trail
             await sessionCacheRecord(recorder, sessionId, record, engineOut, state)
+            // Segment-level continuity: the next piece of this block — and
+            // the next block — continues from this translation.
+            pushTranslationContext(context, seg, translated)
             return translated
           }
           // Build a translate function that uses translateBySegments. The
@@ -2839,9 +2854,6 @@ async function* translateStream(original, config, signal, llm, currentModel, rec
 
           // Post-process (punctuation localization only)
           const finalText = postProcess(translated, null, null, language)
-
-          // Advance the rolling context so the next block continues here.
-          pushTranslationContext(context, fullText, finalText)
 
           // Cache
           cacheSet(state, cacheKey, translated)
