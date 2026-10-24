@@ -123,6 +123,9 @@ per provider — `zh-Hans` / `zh-Hant` for Bing, `zh-CN` / `zh-TW` for Google.
   carry `purpose: 'translation'`, the same mechanism `session-title` and
   compaction use, so pipeline observers can tell an auxiliary call from a
   conversation turn.
+- **Consecutive blocks translate with continuity.** The tail of the previously
+  translated passage (source + translation) rides along in the prompt, so
+  pronouns, terminology and tone stay consistent across blocks and sentences.
 - **No translation recursion.** The re-entrancy guard targets only the
   `llm/stream` call this plugin itself issues (detected via an async-local
   store), so translation never translates itself — and never suppresses a
@@ -280,6 +283,8 @@ entirely.
   和配方修订号，因此提示词一变，缓存即从零开始。
 - **翻译调用带辅助标识。** 模型路由的翻译请求携带 `purpose: 'translation'` ——
   与 `session-title`、压缩相同的机制 —— 让管道观察者能把它和对话轮次区分开。
+- **相邻块带上下文翻译。** 上一段已译内容（原文 + 译文）的尾部会随提示词一起发送，
+  代词、术语和语气因此跨块、跨句保持一致。
 - **没有翻译递归。** 重入守卫只针对插件自己发起的那次 `llm/stream` 调用（用
   async-local 存储识别），因此翻译不会去翻译翻译本身——也不会误杀并发的真实流。
 - **并发流是安全的。** 守卫是按调用而非进程级开关，因此同时运行的 teammate、

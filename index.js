@@ -2033,7 +2033,23 @@ async function providerForModel(llm, modelId, state) {
  *   recent translations, injected into the system prompt to keep terminology
  *   consistent across a conversation.
  */
-async function translateWithLlm(llm, provider, model, text, targetLanguage, timeoutMs, signal, glossary) {
+/** Tail of a passage kept as translation continuity context, bounded so the
+ *  added prompt stays a fixed small cost no matter how long the block was. */
+const CONTEXT_TAIL_CHARS = 700
+
+function contextTail(text) {
+  if (!text) return ''
+  return text.length > CONTEXT_TAIL_CHARS ? text.slice(-CONTEXT_TAIL_CHARS) : text
+}
+
+/** Advance the rolling translation context after a successful translation. */
+function pushTranslationContext(context, source, target) {
+  if (!context) return
+  context.source = contextTail(source)
+  context.target = contextTail(target)
+}
+
+async function translateWithLlm(llm, provider, model, text, targetLanguage, timeoutMs, signal, glossary, context) {
   if (text === '') return ''
 
   const controller = new AbortController()
@@ -2064,6 +2080,13 @@ async function translateWithLlm(llm, provider, model, text, targetLanguage, time
       // the target can be anything.
       if (glossary && glossary.length > 0) {
         system += `\n\nKeep these terms exactly as written — they are proper nouns and identifiers the text uses unchanged:\n${glossary.map(g => `- "${g.source}"`).join('\n')}`
+      }
+      // Continuity: show the tail of what was translated immediately before
+      // this text so pronouns, terminology and tone stay consistent across
+      // blocks. The context is read-only reference material — the model must
+      // still return only the translation of the user message.
+      if (context && context.source && context.target) {
+        system += `\n\nThe text continues directly after the following already-translated passage. Keep terminology, names and style consistent with that translation, but translate ONLY the user's text:\n<previous_source>${context.source}</previous_source>\n<previous_translation>${context.target}</previous_translation>`
       }
       const messages = [{ role: 'user', content: [{ type: 'text', text }] }]
       const options = { ...prepared.config, system, messages, signal: controller.signal,
@@ -2207,7 +2230,7 @@ const SENTENCE_MIN_CHARS = 10
  *  translate → postProcess) but on a single sentence, with caching.
  *  Resolves provider/model the same way as the block-end path.
  *  On failure, falls back to the original text (never breaks the stream). */
-async function translateSentence(text, config, signal, llm, currentModel, language, recorder, sessionId, state) {
+async function translateSentence(text, config, signal, llm, currentModel, language, recorder, sessionId, context, state) {
   if (!text || text.trim() === '') return text
 
   // Detect source language on original text (before segment splitting)
@@ -2252,7 +2275,7 @@ async function translateSentence(text, config, signal, llm, currentModel, langua
     }
     return isFreeEngine
       ? translateText(provider, seg, language, config.timeoutMs, signal)
-      : translateWithLlm(llm, provider, model, seg, language, config.timeoutMs, signal, glossaryContext)
+      : translateWithLlm(llm, provider, model, seg, language, config.timeoutMs, signal, glossaryContext, context)
   }
   // Session-backed durable cache around every engine call — same wrapping as
   // the block-end path: a hit skips the engine, a miss is recorded.
@@ -2299,6 +2322,9 @@ async function translateSentence(text, config, signal, llm, currentModel, langua
 
   // Post-process (punctuation localization only)
   const result = postProcess(translated, null, null, language)
+
+  // Advance the rolling context so the next sentence/block continues here.
+  pushTranslationContext(context, text, result)
 
   // Debug log
   const segments = splitByCodeBlocks(text)
@@ -2355,6 +2381,10 @@ async function* translateStream(original, config, signal, llm, currentModel, rec
   const passthrough = new Set()
   const language = resolveLanguage(config.targetLanguage, config.interfaceLanguage)
   const targetFamily = languageFamily(language)
+  // Rolling continuity context for LLM routes: the tail of the most recently
+  // translated passage (source + translation), shared across blocks so each
+  // call knows what came immediately before it.
+  const context = { source: '', target: '' }
 
   for await (const chunk of original) {
     switch (chunk.type) {
@@ -2445,7 +2475,7 @@ async function* translateStream(original, config, signal, llm, currentModel, rec
 
               // Translate and yield as a synthetic delta.
               const translated = await translateSentence(
-                sentence, config, signal, llm, currentModel, language, recorder, sessionId, state)
+                sentence, config, signal, llm, currentModel, language, recorder, sessionId, context, state)
               yield { type: chunk.type, index: chunk.index, text: translated }
 
               // Track translated parts for block-end text rebuild.
@@ -2537,7 +2567,7 @@ async function* translateStream(original, config, signal, llm, currentModel, rec
           let remainingTranslated = ''
           if (entry.text.trim()) {
             remainingTranslated = await translateSentence(
-              entry.text, config, signal, llm, currentModel, language, recorder, sessionId, state)
+              entry.text, config, signal, llm, currentModel, language, recorder, sessionId, context, state)
           }
           const finalText = entry.translatedParts.join('') +
             (entry.yieldedText || '') + remainingTranslated
@@ -2639,7 +2669,7 @@ async function* translateStream(original, config, signal, llm, currentModel, rec
             }
             return isFreeEngine
               ? translateText(provider, seg, language, config.timeoutMs, signal)
-              : translateWithLlm(llm, provider, model, seg, language, config.timeoutMs, signal, glossaryContext)
+              : translateWithLlm(llm, provider, model, seg, language, config.timeoutMs, signal, glossaryContext, context)
           }
           // Every engine call goes through the session-backed durable cache:
           // a hit skips the engine (including calls made before this process
@@ -2704,6 +2734,9 @@ async function* translateStream(original, config, signal, llm, currentModel, rec
 
           // Post-process (punctuation localization only)
           const finalText = postProcess(translated, null, null, language)
+
+          // Advance the rolling context so the next block continues here.
+          pushTranslationContext(context, fullText, finalText)
 
           // Cache
           cacheSet(state, cacheKey, translated)
