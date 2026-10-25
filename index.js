@@ -2135,9 +2135,16 @@ async function translateWithLlm(llm, provider, model, text, targetLanguage, time
       // Continuity: show the tail of what was translated immediately before
       // this text so pronouns, terminology and tone stay consistent across
       // blocks. The context is read-only reference material — the model must
-      // still return only the translation of the user message.
+      // still return only the translation of the user message. The context
+      // itself is earlier model output, so the framing delimiters are
+      // stripped from the content: an earlier message containing the literal
+      // tag text (this plugin being discussed, or adversarially) must not be
+      // able to forge a context boundary and smuggle instructions into the
+      // framing. Glossary terms need no such treatment — their extraction
+      // regex admits only [A-Za-z0-9-].
       if (context && context.source && context.target) {
-        system += `\n\nThe text continues directly after the following already-translated passage. Keep terminology, names and style consistent with that translation, but translate ONLY the user's text:\n<previous_source>${context.source}</previous_source>\n<previous_translation>${context.target}</previous_translation>`
+        const unforge = (s) => s.replace(/<\/?previous_(?:source|translation)>/g, '')
+        system += `\n\nThe text continues directly after the following already-translated passage. Keep terminology, names and style consistent with that translation, but translate ONLY the user's text:\n<previous_source>${unforge(context.source)}</previous_source>\n<previous_translation>${unforge(context.target)}</previous_translation>`
       }
       const messages = [{ role: 'user', content: [{ type: 'text', text }] }]
       const options = { ...prepared.config, system, messages, signal: controller.signal,
