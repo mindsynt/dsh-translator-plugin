@@ -2328,7 +2328,9 @@ async function translateSentence(text, config, signal, llm, currentModel, langua
   const cacheKey = hashKey(text, language, provider)
   const cached = cacheGet(state, cacheKey)
   if (cached !== undefined) {
-    return postProcess(cached, null, null, language)
+    const cachedText = postProcess(cached, null, null, language)
+    pushTranslationContext(context, text, cachedText)
+    return cachedText
   }
 
   // Build the translate function
@@ -2385,10 +2387,15 @@ async function translateSentence(text, config, signal, llm, currentModel, langua
   const chunkSize = provider === 'opus'
     ? Math.min(config.maxTextChars, OPUS_MAX_CHARS)
     : config.maxTextChars
+  // Snapshot for failure rollback: the per-segment pushes below must not
+  // survive a failed sentence, whose displayed text is the original.
+  const sentenceSnapshot = { source: context.source, target: context.target }
   let translated
   try {
     translated = await translateBySegments(text, translateFn, chunkSize)
   } catch (_e) {
+    context.source = sentenceSnapshot.source
+    context.target = sentenceSnapshot.target
     return text
   }
 
@@ -2402,6 +2409,8 @@ async function translateSentence(text, config, signal, llm, currentModel, langua
       detected,
       language,
     })
+    context.source = sentenceSnapshot.source
+    context.target = sentenceSnapshot.target
     return text
   }
 
@@ -2681,6 +2690,16 @@ async function* translateStream(original, config, signal, llm, currentModel, rec
         const mode = config.provider
         let provider, model
         const startedAt = Date.now()
+        // Rolling-context snapshot. Every branch that discards a block's
+        // translation (engine failure, garbled output, a failed fallback
+        // retry) must roll the context back: the next block has to continue
+        // from what the user actually reads, not from segments of a
+        // translation that was thrown away.
+        const contextSnapshot = { source: context.source, target: context.target }
+        const restoreContext = () => {
+          context.source = contextSnapshot.source
+          context.target = contextSnapshot.target
+        }
         try {
           // Step 1: Split by code blocks (segment translation approach)
           const segments = splitByCodeBlocks(fullText)
@@ -2819,6 +2838,10 @@ async function* translateStream(original, config, signal, llm, currentModel, rec
           try {
             translated = await translateFn(fullText)
           } catch (e) {
+            // Discard the partial pushes of the failed attempt so the retry
+            // starts from the pre-block state instead of stitching its first
+            // segments to the dead attempt's tail.
+            restoreContext()
             if (!isFreeEngine && currentModel.model && currentModel.model !== model) {
               logEvent('fallback', {
                 what: `block ${chunk.index} (${blockType || 'unknown'})`,
@@ -2848,6 +2871,7 @@ async function* translateStream(original, config, signal, llm, currentModel, rec
               target: translated.slice(0, 100),
               provider, mode,
             })
+            restoreContext()
             yield { ...chunk, block: { ...chunk.block, text: fullText } }
             break
           }
@@ -2885,6 +2909,10 @@ async function* translateStream(original, config, signal, llm, currentModel, rec
           })
           yield { ...chunk, block: { ...chunk.block, text: finalText } }
         } catch (e) {
+          // The user is about to see the original text — roll the rolling
+          // context back to the pre-block state so the next block continues
+          // from displayed content, not from segments of a failed attempt.
+          restoreContext()
           // Translation failed — flush original buffered chunks so the client at
           // least has the foreign-language original, then the unmodified
           // block-end so it can finalize the block. The fallback is unchanged,
