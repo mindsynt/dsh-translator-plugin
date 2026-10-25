@@ -213,44 +213,7 @@ function modelLooksComplete(dir) {
   }
 }
 
-/** List the pairs already present locally, so the settings form can show the
- *  user what is cached without re-reading the disk on every render. */
-export function listOfflineModels(overrideDir) {
-  const out = []
-  const dirs = [overrideDir && overrideDir.trim() ? overrideDir.trim() : '', BUNDLED_MODEL_DIR, offlineRoot()]
-  const seen = new Set()
-  for (const root of dirs) {
-    if (!root || seen.has(root)) continue
-    seen.add(root)
-    let entries
-    try { entries = readdirSync(root, { withFileTypes: true }) } catch { continue }
-    for (const e of entries) {
-      if (!e.isDirectory() || !e.name.startsWith('opus-mt-')) continue
-      const pair = e.name.slice('opus-mt-'.length)
-      if (modelLooksComplete(path.join(root, e.name))) out.push(pair)
-    }
-  }
-  return [...new Set(out)].sort()
-}
 
-/** Get download progress for a model pair. Returns null if no download in progress. */
-export function getDownloadProgress(pair, overrideDir) {
-  const dir = modelDirFor(pair, overrideDir)
-  const progressFile = path.join(dir, '.download-progress')
-  try {
-    if (!existsSync(progressFile)) return null
-    const data = JSON.parse(readFileSync(progressFile, 'utf-8'))
-    // Check if progress is stale (older than 5 minutes)
-    if (Date.now() - data.time > 5 * 60 * 1000) {
-      // Clean up stale progress file
-      try { unlinkSync(progressFile) } catch { /* best effort */ }
-      return null
-    }
-    return data
-  } catch {
-    return null
-  }
-}
 
 /** Download one file, streaming to a `.part` sibling and renaming on success.
  *  Returns false on any failure so the caller can retry or surface it.
@@ -440,7 +403,7 @@ async function translatorFor(state, pair, config) {
   return t
 }
 
-/** Split text around the placeholder tokens emitted by extractCode / extractNouns
+/** Split text around the placeholder tokens emitted by extractNouns
  *  into pieces the model can translate on its own.
  *
  *  A neural model will happily translate a placeholder (`[[⟪0⟫]]` becomes
@@ -471,7 +434,7 @@ async function loadOffline(state, pair, config) {
  *  (flush the original block verbatim) applies, so a broken offline engine can
  *  never break a stream — but it also cannot silently degrade: every failure
  *  is logged with the pair, the model directory, and the elapsed time. */
-export async function translateOffline(text, pair, config, signal, targetLanguage, state) {
+async function translateOffline(text, pair, config, signal, targetLanguage, state) {
   if (text === '') return ''
   if (signal && signal.aborted) throw new Error('translation aborted')
 
@@ -752,86 +715,6 @@ function parseResponse(payload, provider) {
   return translated.text
 }
 
-/**
- * Strip Markdown fenced code blocks and inline code from `text`, replacing
- * each with a stable numbered placeholder like `[[⟪0⟫]]`. Returns the
- * code-stripped text plus an ordered list of the original code spans, so
- * callers can translate the surrounding prose and then reinsert the code
- * verbatim with {@link reinsertCode}. Code is never sent to the translation
- * service, so it is never translated regardless of provider.
- * @param text - raw block text possibly containing code.
- */
-function extractCode(text) {
-  const spans = []
-  const placeholder = () => {
-    const i = spans.length
-    return `[[⟪${i}⟫]]`
-  }
-
-  let stripped = text
-  // Fenced code blocks: ```lang\n...\n``` or ~~~lang\n...\n~~~  (non-greedy
-  // over the body so adjacent blocks each match on their own). The push happens
-  // AFTER capturing the index so the placeholder matches the stored position.
-  stripped = stripped.replace(/```[\s\S]*?```|~~~[\s\S]*?~~~/g, (m) => {
-    const p = placeholder()
-    spans.push(m)
-    return p
-  })
-  // Inline code: `...`  (after fenced blocks are gone, backticks left are inline)
-  stripped = stripped.replace(/`[^`\n]+`/g, (m) => {
-    const p = placeholder()
-    spans.push(m)
-    return p
-  })
-
-  // Markdown links: [text](url) — protect the URL part so it's never translated.
-  // The text part inside brackets will be translated normally.
-  stripped = stripped.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (m, text, url) => {
-    const urlPlaceholder = placeholder()
-    spans.push(url)
-    return `[${text}](${urlPlaceholder})`
-  })
-
-  // HTML/XML tags: <tag>, <tag attr="value">, </tag>, <tag/>
-  // Protect the entire tag so attributes and structure are never translated.
-  stripped = stripped.replace(/<\/?[a-zA-Z][a-zA-Z0-9]*[^>]*\/?>/g, (m) => {
-    const p = placeholder()
-    spans.push(m)
-    return p
-  })
-
-  return { stripped, spans }
-}
-
-
-/** Replace each `[[⟪n⟫]]` placeholder in `translated` with the matching
- * saved code span (by index). Any placeholder the translation dropped is
- * re-added by appending its span at the end so code is never lost; any
- * placeholder the translation left through is removed defensively. */
-function reinsertCode(translated, spans) {
-  let result = translated
-  const used = []
-  if (spans.length > 0) {
-    for (let i = 0; i < spans.length; i++) {
-      const placeholder = `[[⟪${i}⟫]]`
-      const starredPlaceholder = `[[⟪*${i}⟫]]`
-      if (result.includes(placeholder)) {
-        result = result.split(placeholder).join(spans[i])
-        used[i] = true
-      } else if (result.includes(starredPlaceholder)) {
-        result = result.split(starredPlaceholder).join(spans[i])
-        used[i] = true
-      }
-    }
-    let tail = ''
-    for (let i = 0; i < spans.length; i++) {
-      if (!used[i]) tail += spans[i]
-    }
-    result += tail
-  }
-  result = result.replace(/\[\[⟪\*?\d+⟫\]\]/g, '')
-  return result
-}
 
 /** Split `text` into chunks of at most `chunkSize` characters, preferring to
  * break at paragraph, sentence, or whitespace boundaries so each chunk is a
