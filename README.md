@@ -76,10 +76,12 @@ per provider — `zh-Hans` / `zh-Hant` for Bing, `zh-CN` / `zh-TW` for Google.
 
 ### What it never breaks
 
-- **Code and identifiers are never translated.** Fenced code blocks are split
-  out as their own segments and never sent to any engine. Inline proper nouns,
-  CamelCase identifiers, URLs, version numbers and template variables are
-  swapped for `[[⟪*0⟫]]`-style placeholders before the text leaves the
+- **Code, identifiers and symbols are never translated.** Fenced code blocks
+  are split out as their own segments and never sent to any engine. Inline
+  proper nouns, CamelCase identifiers, URLs, version numbers, template
+  variables, and symbol/emoji runs (arrows, check marks, ZWJ family emoji,
+  keycaps — currency symbols excluded so number localization keeps working)
+  are swapped for `[[⟪*0⟫]]`-style placeholders before the text leaves the
   process, then reinserted verbatim; a placeholder the translation dropped is
   appended back at the end — it is never lost.
 - **Translation failures never break the stream.** Any error — a timeout, an
@@ -262,10 +264,11 @@ entirely.
 
 ### 它不会弄坏什么
 
-- **代码与标识符从不被翻译。** 围栏代码块会被拆成独立段落，不发给任何引擎。行内
-  专有名词、CamelCase 标识符、URL、版本号和模板变量在文本离开进程前被替换成
-  `[[⟪*0⟫]]` 形式的占位符，翻译完再原样插回；翻译丢掉的占位符会被追加回结尾 ——
-  代码不会丢。
+- **代码、标识符与符号从不被翻译。** 围栏代码块会被拆成独立段落，不发给任何引擎。
+  行内专有名词、CamelCase 标识符、URL、版本号、模板变量以及符号/emoji（箭头、
+  对勾、ZWJ 家庭 emoji、按键帽 —— 货币符号除外，数字本地化仍有效）在文本离开进程
+  前被替换成 `[[⟪*0⟫]]` 形式的占位符，翻译完再原样插回；翻译丢掉的占位符会被
+  追加回结尾 —— 代码不会丢。
 - **翻译失败不会弄断流。** 任何错误 —— 超时、HTTP 失败、响应格式异常、模型不受
   支持、或者整条翻译返回空 —— 都会把原文原样冲出。每一次失败同时写入
   host 进程日志，带上 provider、模型、目标语言、超时值和耗时，所以「没有翻译」是

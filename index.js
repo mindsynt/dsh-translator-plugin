@@ -968,6 +968,19 @@ function extractNouns(text) {
     }
   )
 
+  // Step 2b: Protect symbol and emoji runs — arrows, check marks, math and
+  // technical symbols, emoji (including ZWJ family sequences, variation
+  // selectors and keycaps). Engines verbalize or drop them ("→" becomes
+  // "到", emoji vanish); they are presentation, not prose, so they never
+  // reach the engine. Currency symbols stay unprotected so number
+  // localization still sees "$1,000".
+  stripped = stripped.replace(/\d\uFE0F?\u20E3|[\p{S}][\u200D\uFE0F\p{S}\u20E3]*/gu, (m) => {
+    if (/^[$€£¥₩]+$/.test(m)) return m
+    const p = placeholder()
+    spans.push(m)
+    return p
+  })
+
   // Step 2: Build a single alternation regex from PROPER_NOUNS, longest-first
   // so "DeepSeek-V3" matches before "DeepSeek".
   const nounRegex = new RegExp(
