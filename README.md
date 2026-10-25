@@ -60,10 +60,10 @@ exposes all of them, including the two advanced ones:
 | `targetLanguage` | `auto` | `auto` follows the interface language (pushed by the client); falls back to the host `LANG` |
 | `translateOutput` | `true` | |
 | `translateThinking` | `true` | |
+| `translateMode` | `block` | `block` translates at block-end (higher quality); `sentence` translates each sentence as it completes (lower latency) |
 | `timeoutMs` | `10000` | Per translation request, bounded to 100–60000. Raise it for model routes — a `maxTextChars`-sized segment often takes longer than 10 s. Not used by `opus`, which has no timeout |
 | `maxTextChars` | `4000` | Per-request segment size; longer blocks are split and translated in full (no hard cap). `opus` caps segments at 2000 chars regardless |
 | `offlinePair` | `auto` | Offline only. `auto` infers the pair per block from its detected language; otherwise force a direction like `en-zh` |
-| `offlineModelDir` | *(empty)* | Offline only. Override for `$DSH_HOME/model-translator/models` |
 | `offlineThreads` | `4` | Offline only. CPU threads for the CTranslate2 backend, 1–32 |
 | `offlineBeamSize` | `4` | Offline only. Beam search width, 1–12 |
 | `offlineAutoDownload` | `false` | Offline only. When off, only bundled or already-cached models work; when on, other pairs download ~160 MB on first use (HuggingFace, hf-mirror and ModelScope tried in order). Progress goes to the JSONL log and a `.download-progress` file in the model directory — there is no UI channel for it |
@@ -249,10 +249,10 @@ entirely.
 | `targetLanguage` | `auto` | `auto` 跟随界面语言（由 client 推送）；回退到 host `LANG` |
 | `translateOutput` | `true` | |
 | `translateThinking` | `true` | |
+| `translateMode` | `block` | `block` 块尾翻译（质量更好）；`sentence` 逐句翻译（延迟更低） |
 | `timeoutMs` | `10000` | 单次翻译请求，限制在 100–60000。模型路由建议调大 —— 一个 `maxTextChars` 大小的分段常常比 10 秒更久。`opus` 不使用此项（离线推理无超时） |
 | `maxTextChars` | `4000` | 每段请求大小；更长的块会被切分并完整翻译（无硬上限）。`opus` 无论如何都把分段限制在 2000 字符 |
 | `offlinePair` | `auto` | 仅离线。`auto` 按每个块的检测语言推断语言对；也可固定方向如 `en-zh` |
-| `offlineModelDir` | *(空)* | 仅离线。覆盖 `$DSH_HOME/model-translator/models` |
 | `offlineThreads` | `4` | 仅离线。CTranslate2 后端 CPU 线程数，1–32 |
 | `offlineBeamSize` | `4` | 仅离线。束搜索宽度，1–12 |
 | `offlineAutoDownload` | `false` | 仅离线。关闭时仅使用捆绑或已缓存的模型；开启后其他语言对首次使用时下载约 160 MB（按顺序尝试 HuggingFace、hf-mirror 与 ModelScope）。进度写入 JSONL 日志和模型目录下的 `.download-progress` 文件 —— 没有UI通道 |
