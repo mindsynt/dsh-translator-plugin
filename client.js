@@ -51,21 +51,11 @@ window.__ModuleLoader__.load({
       offlinePairCap: 'Forced pair',
       offlineAutoDownload: 'Download other language pairs automatically',
       offlineAutoDownloadHint: 'The en\u2013zh model ships bundled. When this is on, other pairs download from HuggingFace on first use (~160MB Opus-MT, ~600MB NLLB).',
-      offlineModelSources: 'Model download sources',
-      offlineModelSourcesHint: 'Tried in order when the first fails. Select a preset or custom.',
       sourceDefault: 'Default (try all in order)',
       sourceCustom: 'Custom',
-      offlineCached: 'Pairs available locally',
-      offlineNone: 'none',
-      offlineModelDir: 'Model download location',
-      offlineModelDirHint: 'Downloaded models are saved to this directory. Default: ~/.dsh/model-translator/models/. You can set offlineModelDir to change it.',
       offlineNote: 'Long blocks are split below 2000 chars because Opus-MT models have a 512-token context limit. Offline inference is synchronous CPU work, so concurrent segments are run serially.',
       offlinePrefetch: 'Prefetch model',
       offlinePrefetchHint: 'Download a model in advance. Select a model and click Download, then save settings and restart the plugin. Download status is logged.',
-      prefetchNone: '— Select model —',
-      prefetchDownload: 'Download',
-      prefetchDownloading: 'Starting...',
-      prefetchSelectModel: 'Please select a model to download.',
       progressDownloading: 'Downloading model…',
       progressFile: 'File',
       progressOf: 'of',
@@ -127,21 +117,11 @@ window.__ModuleLoader__.load({
       offlinePairCap: '固定语言对',
       offlineAutoDownload: '自动下载其他语言对的模型',
       offlineAutoDownloadHint: 'en-zh 模型已随插件捆绑。开启后，其他语言对首次使用时从 HuggingFace 下载（Opus-MT 约 160MB，NLLB 约 600MB）；关闭后，仅捆绑的或已缓存的模型可用。',
-      offlineModelSources: '模型下载源',
-      offlineModelSourcesHint: '下载失败时按顺序尝试这些源。选择预设源或自定义。',
       sourceDefault: '默认（按顺序尝试所有源）',
       sourceCustom: '自定义',
-      offlineCached: '本地已有语言对',
-      offlineNone: '无',
-      offlineModelDir: '模型下载位置',
-      offlineModelDirHint: '下载的模型保存在此目录。默认：~/.dsh/model-translator/models/。可通过 offlineModelDir 配置修改。',
       offlineNote: '长块会切分到 2000 字符以下，因为 Opus-MT 模型有 512 token 上下文上限。离线推理是同步 CPU 计算，因此分段串行执行。',
       offlinePrefetch: '预下载模型',
       offlinePrefetchHint: '提前下载模型。选择模型后点击下载，保存设置并重启插件。下载状态会记录在日志中。',
-      prefetchNone: '— 选择模型 —',
-      prefetchDownload: '下载',
-      prefetchDownloading: '正在启动...',
-      prefetchSelectModel: '请选择要下载的模型。',
       progressDownloading: '正在下载模型…',
       progressFile: '文件',
       progressOf: '/',
@@ -298,9 +278,6 @@ window.__ModuleLoader__.load({
       const [maxTextChars,  setMaxTextChars]  = useState(value.maxTextChars  ?? 4000);
       const [offlinePair,   setOfflinePair]   = useState(value.offlinePair   ?? 'auto');
       const [offlineAutoDownload, setOfflineAutoDownload] = useState(value.offlineAutoDownload ?? false);
-      const [prefetching, setPrefetching] = useState(false);
-      const [downloadProgress, setDownloadProgress] = useState(null);
-      const [offlinePairs,  setOfflinePairs]  = useState([]);
 
       const [saving, setSaving] = useState(false);
       const [saved,  setSaved]  = useState(false);
@@ -328,20 +305,6 @@ window.__ModuleLoader__.load({
         setOfflinePair(v.offlinePair ?? 'auto');
         setOfflineAutoDownload(v.offlineAutoDownload ?? false);
         setError(null);
-      }, [snapshot.value]);
-
-      /* track download progress — this is a volatile field updated by the
-         host during ensureModel(); it's not part of the editable signature */
-      useEffect(() => {
-        const v = snapshot.value ?? {};
-        const raw = v.downloadProgress;
-        if (!raw || raw === '') { setDownloadProgress(null); return; }
-        try {
-          const p = JSON.parse(raw);
-          setDownloadProgress(p);
-        } catch {
-          setDownloadProgress(null);
-        }
       }, [snapshot.value]);
 
       /* auto-clear the "Saved!" toast */
@@ -672,20 +635,7 @@ window.__ModuleLoader__.load({
           const [snapshot, setSnapshot] = useState(form.getSnapshot());
           useEffect(() => {
             const unsub = form.subscribe(() => setSnapshot(form.getSnapshot()));
-            // Volatile field updates (downloadProgress) don't trigger form.subscribe,
-            // so poll every second to catch them.
-            let lastProgress = '';
-            const poll = () => {
-              const snap = form.getSnapshot();
-              const progress = snap.value?.downloadProgress || '';
-              if (progress !== lastProgress) {
-                lastProgress = progress;
-                setSnapshot(snap);
-              }
-            };
-            const interval = setInterval(poll, 1000);
-            poll();
-            return () => { unsub(); clearInterval(interval); };
+            return unsub;
           }, []);
 
           const [, forceModels] = useState(0);

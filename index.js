@@ -6,6 +6,7 @@
 import { createHash } from 'node:crypto'
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { createReadStream, createWriteStream } from 'node:fs'
+import { pipeline } from 'node:stream/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -263,8 +264,11 @@ async function downloadFile(url, dest, progressFile, currentFile, totalFiles) {
     // No redirect option is passed deliberately: follow the CDN, but do not
     // silently hand the text anywhere else. Credentials are omitted so no
     // cookie or bearer token ever leaves the host process.
-    const bytes = Buffer.from(await response.arrayBuffer())
-    writeFileSync(part, bytes)
+    // Stream to disk instead of buffering: a model file is 160–600 MB, and
+    // `arrayBuffer()` would hold the whole thing in host memory at once —
+    // on top of a second copy inside the Buffer constructor.
+    await pipeline(response.body, createWriteStream(part))
+    const bytes = Number(response.headers.get('content-length')) || statSync(part).size
     renameSync(part, dest)
     // Write progress update after file completes
     if (progressFile) {
@@ -274,7 +278,7 @@ async function downloadFile(url, dest, progressFile, currentFile, totalFiles) {
           file: currentFile,
           fileIndex: (Array.isArray(totalFiles) ? totalFiles.indexOf(currentFile) + 1 : 1),
           totalFiles: Array.isArray(totalFiles) ? totalFiles.length : 1,
-          bytes: bytes.length,
+          bytes,
           time: Date.now(),
         }
         writeFileSync(progressFile, JSON.stringify(progress))
@@ -303,9 +307,23 @@ function modelFileUrl(base, repo, file) {
  *  that names what was tried. Tries each source in order until one succeeds —
  *  a source that fails mid-way leaves its completed files behind and the next
  *  source skips them, so a flaky mirror never restarts from zero. */
+/** One download in flight per pair: two concurrent streams that both need a
+ *  missing model would otherwise race on the same .part files and corrupt
+ *  each other. Later callers await the first attempt's outcome instead. */
+const modelDownloads = new Map()
+
 async function ensureModel(pair, config) {
   const dir = modelDirFor(pair, '')
   if (modelLooksComplete(dir)) return dir
+
+  const inflight = modelDownloads.get(pair)
+  if (inflight) {
+    await inflight
+    // The first attempt succeeded: the model is there. If it failed, this
+    // caller retries below (not concurrently) — the guard is about mutual
+    // exclusion, not single-shot semantics.
+    if (modelLooksComplete(dir)) return dir
+  }
 
   const isNllb = pair.startsWith('nllb-')
   const repo = isNllb ? NLLB_REPOS[pair.slice('nllb-'.length)] : HF_REPO(pair)
@@ -324,6 +342,7 @@ async function ensureModel(pair, config) {
   const progressFile = path.join(dir, '.download-progress')
   logEvent('offline-download-start', { pair, repo, dir, files: missing.length })
   let lastFailure = ''
+  const attempt = (async () => {
   for (const base of DEFAULT_MODEL_SOURCES) {
     let ok = true
     for (const file of missing) {
@@ -344,6 +363,14 @@ async function ensureModel(pair, config) {
     logEvent('offline-download-source-failed', { pair, base, url: lastFailure })
   }
   throw new Error(`could not download offline model "${pair}" from any source; last failure: ${lastFailure}`)
+  })()
+  modelDownloads.set(pair, attempt.then(() => {}, () => {}))
+  try {
+    await attempt
+  } finally {
+    modelDownloads.delete(pair)
+  }
+  return dir
 }
 
 /** Lazily load the native addon once. Fails once and stays failed, so an
@@ -1149,12 +1176,23 @@ function repairMarkdownLinks(text) {
  *  DSH_HOME) and finally to `$TMPDIR/logs/`. Logging never throws into
  *  translation, and a log directory it cannot create is swallowed silently
  *  rather than surfacing as a translation failure. */
+/** Rotate the JSONL log once it passes this size; one generation of history
+ *  is kept as model-translator.log.1. Without rotation the file grows for the
+ *  machine's lifetime — sentence mode writes multiple lines per stream. */
+const LOG_ROTATE_BYTES = 5 * 1024 * 1024
+
 function logEvent(event, extra) {
   try {
     const base = process.env.DSH_HOME || `${process.env.HOME || os.tmpdir()}/.dsh`
     const dir = `${base}/logs`
     mkdirSync(dir, { recursive: true })
-    appendFileSync(`${dir}/model-translator.log`, `${new Date().toISOString()} ${JSON.stringify({ event, ...extra })}\n`)
+    const file = `${dir}/model-translator.log`
+    try {
+      if (statSync(file).size > LOG_ROTATE_BYTES) {
+        renameSync(file, `${file}.1`) // overwrites the previous .1
+      }
+    } catch { /* no file yet, or rotation failed — appending still works */ }
+    appendFileSync(file, `${new Date().toISOString()} ${JSON.stringify({ event, ...extra })}\n`)
   } catch { /* best-effort only */ }
 }
 
@@ -1860,12 +1898,27 @@ function translationIdentity(record) {
  *  Indexes live in `state.records.indexes`. */
 const SESSION_INDEX_UNAVAILABLE = -1
 
+/** Bound on retained per-session record indexes. Each index holds every
+ *  translation ever recorded for its session; without a cap the map grows
+ *  with the number of distinct sessions for the process lifetime. */
+const SESSION_INDEX_MAX = 16
+
 async function sessionIndexFor(recorder, sessionId, signal, state) {
   const existing = state.records.indexes.get(sessionId)
+  if (existing) {
+    // LRU touch: re-insert so the most recently used session is never evicted.
+    state.records.indexes.delete(sessionId)
+    state.records.indexes.set(sessionId, existing)
+  }
   if (existing && !existing.inflight) return existing
   if (existing?.inflight) { await existing.inflight; return state.records.indexes.get(sessionId) }
   const index = existing ?? { map: null, read: 0, inflight: undefined }
   state.records.indexes.set(sessionId, index)
+  while (state.records.indexes.size > SESSION_INDEX_MAX) {
+    const oldest = state.records.indexes.keys().next().value
+    if (oldest === sessionId || oldest === undefined) break
+    state.records.indexes.delete(oldest)
+  }
   index.inflight = (async () => {
     try {
       const mod = await loadSessionRecords(state)
